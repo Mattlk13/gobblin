@@ -48,6 +48,7 @@ dependencies {
   compile externalDependency.guava
   compile externalDependency.guavaretrying
   compile externalDependency.guice
+  compile externalDependency.guiceMultibindings
   compile externalDependency.hadoopClientCommon
   compile externalDependency.hadoopCommon
   compile externalDependency.helix
@@ -60,9 +61,6 @@ dependencies {
   compile externalDependency.jgit
   compile externalDependency.jodaTime
   compile externalDependency.jgrapht
-  compile externalDependency.kafka08
-  compile externalDependency.log4j
-  compile externalDependency.lombok
   compile externalDependency.metricsCore
   compile externalDependency.metricsJvm
   compile externalDependency.pegasus.data
@@ -70,12 +68,12 @@ dependencies {
   compile externalDependency.slf4j
   compile externalDependency.typesafeConfig
   compile externalDependency.zkClient
+  compile externalDependency.joptSimple
 
   testCompile project(":gobblin-example")
 
   // Required for adding Test class into classpath
   testCompile project(":gobblin-runtime").sourceSets.test.output
-  testCompile project(path: ":gobblin-modules:gobblin-kafka-08:", configuration: "tests")
   testCompile project(path: ":gobblin-metastore", configuration: "testFixtures")
   testCompile project(":gobblin-test-utils")
   testCompile externalDependency.byteman
@@ -88,20 +86,32 @@ dependencies {
   testCompile externalDependency.hamcrest
   testCompile externalDependency.jhyde
   testCompile externalDependency.mockito
-  testCompile externalDependency.kafka08Test
 }
 
 // Begin HACK to get around POM being depenendent on the (empty) gobblin-rest-api instead of gobblin-rest-api-rest-client
 def installer = install.repositories.mavenInstaller
 [installer]*.pom*.whenConfigured {pom ->
-    pom.dependencies.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }.artifactId = 'gobblin-flow-config-service-api-rest-client'
-    pom.dependencies.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }.artifactId = 'gobblin-flow-config-service-api-data-template'
+  def it = pom.dependencies
+  def s = it.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }
+  if (s != null) {
+    def t = s.clone()
+    t.artifactId = 'gobblin-flow-config-service-api-data-template'
+    it.add(t)
+    s.artifactId = 'gobblin-flow-config-service-api-rest-client'
+  }
 }
+
 if (rootProject.publishToMaven || rootProject.publishToNexus) {
     def deployer = uploadArchives.repositories.mavenDeployer
     [deployer]*.pom*.whenConfigured {pom ->
-        pom.dependencies.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }.artifactId = 'gobblin-flow-config-service-api-rest-client'
-        pom.dependencies.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }.artifactId = 'gobblin-flow-config-service-api-data-template'
+      def it = pom.dependencies
+      def s = it.find {dep -> dep.groupId == project.group && dep.artifactId == 'gobblin-flow-config-service-api' }
+      if (s != null) {
+        def t = s.clone()
+        t.artifactId = 'gobblin-flow-config-service-api-data-template'
+        it.add(t)
+        s.artifactId = 'gobblin-flow-config-service-api-rest-client'
+      }
     }
 }
 // End HACK
@@ -118,12 +128,6 @@ configurations {
 configurations {
   compile {
     transitive = false
-  }
-
-  testRuntime {
-    resolutionStrategy {
-      force 'com.google.inject:guice:3.0'
-    }
   }
 }
 

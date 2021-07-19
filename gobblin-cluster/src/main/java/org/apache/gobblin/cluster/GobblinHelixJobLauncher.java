@@ -30,7 +30,6 @@ import java.util.concurrent.TimeoutException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.helix.HelixException;
 import org.apache.helix.HelixManager;
 import org.apache.helix.task.JobConfig;
 import org.apache.helix.task.JobQueue;
@@ -93,8 +92,8 @@ import org.apache.gobblin.util.SerializationUtils;
  * </p>
  *
  * <p>
- *   This class runs in the {@link GobblinClusterManager}. The actual task execution happens in the in the
- *   {@link GobblinTaskRunner}.
+ *   This class is instantiated by the {@link GobblinHelixJobScheduler} on every job submission to launch the Gobblin job.
+ *   The actual task execution happens in the {@link GobblinTaskRunner}, usually in a different process.
  * </p>
  *
  * @author Yinan Li
@@ -164,7 +163,7 @@ public class GobblinHelixJobLauncher extends AbstractJobLauncher {
     Config stateStoreJobConfig = ConfigUtils.propertiesToConfig(jobProps)
         .withValue(ConfigurationKeys.STATE_STORE_FS_URI_KEY, ConfigValueFactory.fromAnyRef(
             new URI(appWorkDir.toUri().getScheme(), null, appWorkDir.toUri().getHost(),
-                appWorkDir.toUri().getPort(), null, null, null).toString()));
+                appWorkDir.toUri().getPort(), "/", null, null).toString()));
 
     this.stateStores = new StateStores(stateStoreJobConfig, appWorkDir,
         GobblinClusterConfigurationKeys.OUTPUT_TASK_STATE_DIR_NAME, appWorkDir,
@@ -178,7 +177,8 @@ public class GobblinHelixJobLauncher extends AbstractJobLauncher {
         this.jobContext.getJobState(),
         this.eventBus,
         this.stateStores.getTaskStateStore(),
-        this.outputTaskStateDir);
+        this.outputTaskStateDir,
+        this.getIssueRepository());
 
     this.helixMetrics = helixMetrics;
     startCancellationExecutor();
@@ -254,10 +254,10 @@ public class GobblinHelixJobLauncher extends AbstractJobLauncher {
           // TODO : fix this when HELIX-1180 is completed
           // work flow should never be deleted explicitly because it has a expiry time
           // If cancellation is requested, we should set the job state to CANCELLED/ABORT
-          this.helixTaskDriver.waitToStop(this.helixWorkFlowName, this.helixJobStopTimeoutSeconds);
-          log.info("stopped the workflow ", this.helixWorkFlowName);
+          this.helixTaskDriver.waitToStop(this.helixWorkFlowName, this.helixJobStopTimeoutSeconds * 1000);
+          log.info("stopped the workflow {}", this.helixWorkFlowName);
         }
-      } catch (HelixException e) {
+      } catch (RuntimeException e) {
         // Cancellation may throw an exception, but Helix set the job state to STOP and it should eventually stop
         // We will keep this.cancellationExecuted and this.cancellationRequested to true and not propagate the exception
         log.error("Failed to stop workflow {} in Helix", helixWorkFlowName, e);
@@ -371,6 +371,8 @@ public class GobblinHelixJobLauncher extends AbstractJobLauncher {
     this.jobListener = jobListener;
     boolean isLaunched = false;
     this.runningMap.putIfAbsent(this.jobContext.getJobName(), false);
+
+    Throwable errorInJobLaunching = null;
     try {
       if (this.runningMap.replace(this.jobContext.getJobName(), false, true)) {
         LOGGER.info ("Job {} will be executed, add into running map.", this.jobContext.getJobId());
@@ -379,12 +381,16 @@ public class GobblinHelixJobLauncher extends AbstractJobLauncher {
       } else {
         LOGGER.warn ("Job {} will not be executed because other jobs are still running.", this.jobContext.getJobId());
       }
+      // TODO: Better error handling
+    } catch (Throwable t) {
+      errorInJobLaunching = t;
     } finally {
       if (isLaunched) {
         if (this.runningMap.replace(this.jobContext.getJobName(), true, false)) {
           LOGGER.info ("Job {} is done, remove from running map.", this.jobContext.getJobId());
         } else {
-          throw new IllegalStateException("A launched job should have running state equal to true in the running map.");
+          throw errorInJobLaunching == null ? new IllegalStateException("A launched job should have running state equal to true in the running map.")
+              : new RuntimeException("Failure in launching job:", errorInJobLaunching);
         }
       }
     }

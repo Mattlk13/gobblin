@@ -21,7 +21,6 @@ import java.util.List;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.HttpPost;
@@ -30,13 +29,14 @@ import org.apache.http.message.BasicNameValuePair;
 
 import com.google.common.collect.Lists;
 
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.State;
 import org.apache.gobblin.password.PasswordManager;
 import org.apache.gobblin.source.extractor.exception.RestApiConnectionException;
 import org.apache.gobblin.source.extractor.extract.restapi.RestApiConnector;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
 
 
 /**
@@ -95,11 +95,7 @@ public class SalesforceConnector extends RestApiConnector {
     try {
       HttpPost post = new HttpPost(host + DEFAULT_AUTH_TOKEN_PATH);
       post.setEntity(new UrlEncodedFormEntity(formParams));
-
-      HttpResponse httpResponse = getHttpClient().execute(post);
-      HttpEntity httpEntity = httpResponse.getEntity();
-
-      return httpEntity;
+      return getHttpClient().execute(post).getEntity();
     } catch (Exception e) {
       throw new RestApiConnectionException("Failed to authenticate salesforce host:"
           + host + "; error-" + e.getMessage(), e);
@@ -118,7 +114,7 @@ public class SalesforceConnector extends RestApiConnector {
     }
   }
 
-  static boolean isPasswordGrant(State state) {
+  protected static boolean isPasswordGrant(State state) {
     String userName = state.getProp(ConfigurationKeys.SOURCE_CONN_USERNAME);
     String securityToken = state.getProp(ConfigurationKeys.SOURCE_CONN_SECURITY_TOKEN);
     return (userName != null &&  securityToken != null);

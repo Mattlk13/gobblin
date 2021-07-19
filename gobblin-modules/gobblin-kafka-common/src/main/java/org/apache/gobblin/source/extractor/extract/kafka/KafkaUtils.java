@@ -23,7 +23,9 @@ import org.apache.gobblin.configuration.WorkUnitState;
 
 import java.util.List;
 
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.collect.Lists;
 
 import lombok.extern.slf4j.Slf4j;
@@ -34,6 +36,8 @@ import lombok.extern.slf4j.Slf4j;
  */
 @Slf4j
 public class KafkaUtils {
+
+  private static final String TOPIC_PARTITION_DELIMITER = "-";
 
   /**
    * Get topic name from a {@link State} object. The {@link State} should contain property
@@ -110,7 +114,7 @@ public class KafkaUtils {
    */
   public static boolean containsPartitionAvgRecordSize(State state, KafkaPartition partition) {
     return state.contains(
-        getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + KafkaSource.AVG_RECORD_SIZE);
+        getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + ConfigurationKeys.AVG_RECORD_SIZE);
   }
 
   /**
@@ -119,7 +123,7 @@ public class KafkaUtils {
    */
   public static long getPartitionAvgRecordSize(State state, KafkaPartition partition) {
     return state.getPropAsLong(
-        getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + KafkaSource.AVG_RECORD_SIZE);
+        getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + ConfigurationKeys.AVG_RECORD_SIZE);
   }
 
   /**
@@ -127,7 +131,7 @@ public class KafkaUtils {
    * "[topicname].[partitionid].avg.record.size".
    */
   public static void setPartitionAvgRecordSize(State state, KafkaPartition partition, long size) {
-    state.setProp(getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + KafkaSource.AVG_RECORD_SIZE,
+    state.setProp(getPartitionPropName(partition.getTopicName(), partition.getId()) + "." + ConfigurationKeys.AVG_RECORD_SIZE,
         size);
   }
 
@@ -182,4 +186,15 @@ public class KafkaUtils {
     return Long.parseLong(workUnitState.contains(key) ? workUnitState.getProp(key)
         : workUnitState.getProp(KafkaUtils.getPartitionPropName(key, partitionId), "0"));
   }
+
+  /**
+   * Get topic name from a topic partition
+   * @param topicPartition
+   */
+  public static String getTopicNameFromTopicPartition(String topicPartition) {
+    Preconditions.checkArgument(topicPartition.contains(TOPIC_PARTITION_DELIMITER));
+    List<String> parts = Splitter.on(TOPIC_PARTITION_DELIMITER).splitToList(topicPartition);
+    return Joiner.on(TOPIC_PARTITION_DELIMITER).join(parts.subList(0, parts.size() - 1));
+  }
+
 }

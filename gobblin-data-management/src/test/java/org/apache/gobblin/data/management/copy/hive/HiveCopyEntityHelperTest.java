@@ -17,13 +17,27 @@
 
 package org.apache.gobblin.data.management.copy.hive;
 
+import com.google.common.base.Optional;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-
+import lombok.AllArgsConstructor;
+import org.apache.gobblin.configuration.State;
+import org.apache.gobblin.data.management.copy.CopyEntity;
+import org.apache.gobblin.data.management.copy.entities.PostPublishStep;
+import org.apache.gobblin.data.management.copy.hive.HiveCopyEntityHelper.DeregisterFileDeleteMethod;
+import org.apache.gobblin.hive.HiveRegProps;
+import org.apache.gobblin.metrics.event.MultiTimingEvent;
+import org.apache.gobblin.configuration.ConfigurationKeys;
+import org.apache.gobblin.data.management.copy.CopyConfiguration;
+import org.apache.gobblin.hive.HiveMetastoreClientPool;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
@@ -35,19 +49,6 @@ import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import org.testng.Assert;
 import org.testng.annotations.Test;
-
-import com.google.common.base.Optional;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-
-import lombok.AllArgsConstructor;
-
-import org.apache.gobblin.configuration.State;
-import org.apache.gobblin.data.management.copy.CopyEntity;
-import org.apache.gobblin.data.management.copy.entities.PostPublishStep;
-import org.apache.gobblin.data.management.copy.hive.HiveCopyEntityHelper.DeregisterFileDeleteMethod;
-import org.apache.gobblin.hive.HiveRegProps;
-import org.apache.gobblin.metrics.event.MultiTimingEvent;
 
 
 public class HiveCopyEntityHelperTest {
@@ -312,7 +313,7 @@ public class HiveCopyEntityHelperTest {
 
     HiveCopyEntityHelper helper = Mockito.mock(HiveCopyEntityHelper.class);
     Mockito.when(helper.getDeleteMethod()).thenReturn(DeregisterFileDeleteMethod.NO_DELETE);
-    Mockito.when(helper.getTargetURI()).thenReturn(Optional.of("/targetURI"));
+    Mockito.when(helper.getTargetMetastoreURI()).thenReturn(Optional.of("/targetURI"));
     Mockito.when(helper.getHiveRegProps()).thenReturn(new HiveRegProps(new State()));
     Mockito.when(helper.getDataset()).thenReturn(dataset);
 
@@ -345,6 +346,90 @@ public class HiveCopyEntityHelperTest {
     Path prefixReplacement = new Path("/data/databases/_parallel");
     Path expected = new Path("/data/databases/_parallel/DB1/Table1/SS1/part1.avro");
     Assert.assertEquals(HiveCopyEntityHelper.replacedPrefix(sourcePath, prefixTobeReplaced, prefixReplacement), expected);
+  }
+
+  @Test
+  public void testAddMetadataToTargetTable() throws Exception {
+    org.apache.hadoop.hive.ql.metadata.Table meta_table =
+        new Table(Table.getEmptyTable("testDB", "testTable"));
+
+    Map<String, String> storageParams = new HashMap<>();
+    storageParams.put("path", "randomPath");
+    meta_table.getSd().getSerdeInfo().setParameters(storageParams);
+    HiveCopyEntityHelper.addMetadataToTargetTable(meta_table, new Path("newPath"), "testDB", 10L);
+    Assert.assertEquals(meta_table.getSd().getSerdeInfo().getParameters().get("path"), "newPath");
+
+    storageParams.clear();
+    meta_table.getSd().getSerdeInfo().setParameters(storageParams);
+    HiveCopyEntityHelper.addMetadataToTargetTable(meta_table, new Path("newPath"), "testDB", 10L);
+    Assert.assertFalse(meta_table.getSd().getSerdeInfo().getParameters().containsKey("path"));
+  }
+
+  @Test
+  public void testGetTargetLocationDefault() throws Exception {
+
+    Properties copyProperties = new Properties();
+    copyProperties.put(ConfigurationKeys.DATA_PUBLISHER_FINAL_DIR, "/target");
+    Path testPath = new Path("/testPath");
+    Properties hiveProperties = new Properties();
+    Table table =  new Table(Table.getEmptyTable("testDB", "testTable"));
+    table.setDataLocation(testPath);
+    HiveMetastoreClientPool pool = HiveMetastoreClientPool.get(new Properties(), Optional.absent());
+    HiveDataset dataset = new HiveDataset(new LocalFileSystem(), pool, table, hiveProperties);
+
+    HiveCopyEntityHelper helper = new HiveCopyEntityHelper(dataset,
+        CopyConfiguration.builder(FileSystem.getLocal(new Configuration()), copyProperties).build(),
+        new LocalFileSystem()
+    );
+
+    FileSystem fs = new LocalFileSystem();
+    // test that by default, the input path is the same as the output path
+    Path path = helper.getTargetLocation(fs, testPath, Optional.<Partition>absent());
+    Assert.assertEquals(testPath.toUri().getRawPath(), path.toUri().getRawPath());
+  }
+
+  @Test
+  public void testSetsDatasetShardPath() throws Exception {
+
+    Properties copyProperties = new Properties();
+    copyProperties.put(ConfigurationKeys.DATA_PUBLISHER_FINAL_DIR, "/target");
+    Path testPath = new Path("/testPath/db/table");
+    Properties hiveProperties = new Properties();
+    hiveProperties.setProperty(ConfigurationKeys.USE_DATASET_LOCAL_WORK_DIR, "true");
+    Table table =  new Table(Table.getEmptyTable("testDB", "testTable"));
+    table.setDataLocation(testPath);
+    HiveMetastoreClientPool pool = HiveMetastoreClientPool.get(new Properties(), Optional.absent());
+    HiveDataset dataset = new HiveDataset(new LocalFileSystem(), pool, table, hiveProperties);
+
+    HiveCopyEntityHelper helper = new HiveCopyEntityHelper(dataset,
+        CopyConfiguration.builder(FileSystem.getLocal(new Configuration()), copyProperties).build(),
+        new LocalFileSystem()
+    );
+
+    Assert.assertEquals(helper.getDataset().getDatasetPath(), "/testPath/db/table");
+  }
+
+  @Test
+  public void testSetsDatasetShardPathWithReplacement() throws Exception {
+
+    Properties copyProperties = new Properties();
+    copyProperties.put(ConfigurationKeys.DATA_PUBLISHER_FINAL_DIR, "/target");
+    Path testPath = new Path("/testPath/db/table");
+    Properties hiveProperties = new Properties();
+    hiveProperties.setProperty(ConfigurationKeys.USE_DATASET_LOCAL_WORK_DIR, "true");
+    hiveProperties.setProperty(HiveTargetPathHelper.COPY_TARGET_TABLE_PREFIX_TOBE_REPLACED, "/testPath");
+    hiveProperties.setProperty(HiveTargetPathHelper.COPY_TARGET_TABLE_PREFIX_REPLACEMENT, "/targetPath");
+    Table table =  new Table(Table.getEmptyTable("testDB", "testTable"));
+    table.setDataLocation(testPath);
+    HiveMetastoreClientPool pool = HiveMetastoreClientPool.get(new Properties(), Optional.absent());
+    HiveDataset dataset = new HiveDataset(new LocalFileSystem(), pool, table, hiveProperties);
+
+    HiveCopyEntityHelper helper = new HiveCopyEntityHelper(dataset,
+        CopyConfiguration.builder(FileSystem.getLocal(new Configuration()), copyProperties).build(),
+        new LocalFileSystem()
+    );
+
+    Assert.assertEquals(helper.getDataset().getDatasetPath(), "/targetPath/db/table");
   }
 
   private boolean containsPath(Collection<FileStatus> statuses, Path path) {

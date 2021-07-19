@@ -18,12 +18,12 @@
 package org.apache.gobblin.service;
 
 import java.io.File;
-import java.io.IOException;
-import java.net.ServerSocket;
+import java.util.ArrayList;
 import java.util.Map;
 
 import org.apache.commons.io.FileUtils;
-import org.apache.gobblin.runtime.spec_store.FSSpecStore;
+import org.apache.gobblin.runtime.api.SpecCatalogListener;
+import org.apache.gobblin.runtime.spec_catalog.AddSpecResponse;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -38,6 +38,7 @@ import com.google.inject.Injector;
 import com.google.inject.Module;
 import com.google.inject.name.Names;
 import com.linkedin.data.template.StringMap;
+import com.linkedin.r2.transport.http.client.HttpClientFactory;
 import com.linkedin.restli.client.RestLiResponseException;
 import com.linkedin.restli.common.HttpStatus;
 import com.linkedin.restli.server.resources.BaseResource;
@@ -47,9 +48,13 @@ import org.apache.gobblin.config.ConfigBuilder;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.restli.EmbeddedRestliServer;
 import org.apache.gobblin.runtime.spec_catalog.FlowCatalog;
+import org.apache.gobblin.runtime.spec_store.FSSpecStore;
+
+import static org.mockito.Matchers.any;
+import static org.mockito.Mockito.*;
 
 
-@Test(groups = { "gobblin.service" })
+@Test(groups = { "gobblin.service" }, singleThreaded = true)
 public class FlowConfigTest {
   private FlowConfigClient _client;
   private EmbeddedRestliServer _server;
@@ -76,7 +81,10 @@ public class FlowConfigTest {
 
     Config config = configBuilder.build();
     final FlowCatalog flowCatalog = new FlowCatalog(config);
-
+    final SpecCatalogListener mockListener = mock(SpecCatalogListener.class);
+    when(mockListener.getName()).thenReturn(ServiceConfigKeys.GOBBLIN_SERVICE_JOB_SCHEDULER_LISTENER_CLASS);
+    when(mockListener.onAddSpec(any())).thenReturn(new AddSpecResponse(""));
+    flowCatalog.addListener(mockListener);
     flowCatalog.startAsync();
     flowCatalog.awaitRunning();
 
@@ -84,14 +92,12 @@ public class FlowConfigTest {
        @Override
        public void configure(Binder binder) {
          binder.bind(FlowConfigsResourceHandler.class)
-             .annotatedWith(Names.named(FlowConfigsResource.INJECT_FLOW_CONFIG_RESOURCE_HANDLER))
              .toInstance(new FlowConfigResourceLocalHandler(flowCatalog));
 
          // indicate that we are in unit testing since the resource is being blocked until flow catalog changes have
          // been made
          binder.bindConstant().annotatedWith(Names.named(FlowConfigsResource.INJECT_READY_TO_USE)).to(Boolean.TRUE);
-         binder.bind(RequesterService.class)
-             .annotatedWith(Names.named(FlowConfigsResource.INJECT_REQUESTER_SERVICE)).toInstance(new NoopRequesterService(config));
+         binder.bind(RequesterService.class).toInstance(new NoopRequesterService(config));
        }
     });
 
@@ -101,8 +107,10 @@ public class FlowConfigTest {
     _server.startAsync();
     _server.awaitRunning();
 
+    Map<String, String> transportClientProperties = Maps.newHashMap();
+    transportClientProperties.put(HttpClientFactory.HTTP_REQUEST_TIMEOUT, "10000");
     _client =
-        new FlowConfigClient(String.format("http://localhost:%s/", _server.getPort()));
+        new FlowConfigClient(String.format("http://localhost:%s/", _server.getPort()), transportClientProperties);
   }
 
   private void cleanUpDir(String dir) throws Exception {
@@ -174,15 +182,11 @@ public class FlowConfigTest {
         .setTemplateUris(TEST_TEMPLATE_URI).setSchedule(new Schedule().setCronSchedule(TEST_SCHEDULE))
         .setProperties(new StringMap(flowProperties));
 
-    RestLiResponseException exception = null;
     try {
       _client.createFlowConfig(flowConfig);
     } catch (RestLiResponseException e) {
-      exception = e;
+      Assert.fail("Create Again should pass without complaining that the spec already exists.");
     }
-
-    Assert.assertNotNull(exception);
-    Assert.assertEquals(exception.getStatus(), HttpStatus.S_409_CONFLICT.getCode());
   }
 
   @Test (dependsOnMethods = "testCreateAgain")
@@ -194,8 +198,8 @@ public class FlowConfigTest {
     Assert.assertEquals(flowConfig.getId().getFlowName(), TEST_FLOW_NAME);
     Assert.assertEquals(flowConfig.getSchedule().getCronSchedule(), TEST_SCHEDULE );
     Assert.assertEquals(flowConfig.getTemplateUris(), TEST_TEMPLATE_URI);
-    Assert.assertTrue(flowConfig.getSchedule().isRunImmediately());
-    // Add this asssert back when getFlowSpec() is changed to return the raw flow spec
+    Assert.assertFalse(flowConfig.getSchedule().isRunImmediately());
+    // Add this assert back when getFlowSpec() is changed to return the raw flow spec
     //Assert.assertEquals(flowConfig.getProperties().size(), 1);
     Assert.assertEquals(flowConfig.getProperties().get("param1"), "value1");
   }
@@ -224,6 +228,7 @@ public class FlowConfigTest {
     //Assert.assertEquals(flowConfig.getProperties().size(), 2);
     Assert.assertEquals(retrievedFlowConfig.getProperties().get("param1"), "value1b");
     Assert.assertEquals(retrievedFlowConfig.getProperties().get("param2"), "value2b");
+    Assert.assertEquals(retrievedFlowConfig.getProperties().get(RequesterService.REQUESTER_LIST), RequesterService.serialize(new ArrayList<>()));
   }
 
   @Test (dependsOnMethods = "testUpdate")
@@ -309,8 +314,11 @@ public class FlowConfigTest {
     try {
       _client.updateFlowConfig(flowConfig);
     } catch (RestLiResponseException e) {
-      Assert.fail("Bad update should pass without complaining that the spec does not exists.");
+      Assert.assertEquals(e.getStatus(), HttpStatus.S_404_NOT_FOUND.getCode());
+      return;
     }
+
+    Assert.fail("Update should have raised a 404 error");
   }
 
   @AfterClass(alwaysRun = true)
@@ -324,17 +332,5 @@ public class FlowConfigTest {
     }
     _testDirectory.delete();
     cleanUpDir(TEST_SPEC_STORE_DIR);
-  }
-
-  private static int chooseRandomPort() throws IOException {
-    ServerSocket socket = null;
-    try {
-      socket = new ServerSocket(0);
-      return socket.getLocalPort();
-    } finally {
-      if (socket != null) {
-        socket.close();
-      }
-    }
   }
 }

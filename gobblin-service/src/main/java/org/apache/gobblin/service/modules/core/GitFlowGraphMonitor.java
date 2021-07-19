@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 
-import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.fs.Path;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.diff.DiffEntry;
@@ -67,7 +66,7 @@ public class GitFlowGraphMonitor extends GitMonitoringService {
   public static final String GIT_FLOWGRAPH_MONITOR_PREFIX = "gobblin.service.gitFlowGraphMonitor";
 
   private static final String PROPERTIES_EXTENSIONS = "properties";
-  private static final String CONF_EXTENSIONS = StringUtils.EMPTY;
+  private static final String CONF_EXTENSIONS = "conf";
   private static final String FLOW_EDGE_LABEL_JOINER_CHAR = "_";
   private static final String DEFAULT_GIT_FLOWGRAPH_MONITOR_REPO_DIR = "git-flowgraph";
   private static final String DEFAULT_GIT_FLOWGRAPH_MONITOR_FLOWGRAPH_DIR = "gobblin-flowgraph";
@@ -127,6 +126,11 @@ public class GitFlowGraphMonitor extends GitMonitoringService {
    */
   @Override
   void processGitConfigChanges() throws GitAPIException, IOException {
+    if (flowTemplateCatalog.isPresent() && flowTemplateCatalog.get().getAndSetShouldRefreshFlowGraph(false)) {
+      log.info("Change to template catalog detected, refreshing FlowGraph");
+      this.gitRepo.initRepository();
+    }
+
     List<DiffEntry> changes = this.gitRepo.getChanges();
     Collections.sort(changes, (o1, o2) -> {
       Integer o1Depth = (o1.getNewPath() != null) ? (new Path(o1.getNewPath())).depth() : (new Path(o1.getOldPath())).depth();
@@ -277,7 +281,7 @@ public class GitFlowGraphMonitor extends GitMonitoringService {
     Path filePath = new Path(file);
     String fileExtension = Files.getFileExtension(filePath.getName());
     if (filePath.depth() != depth || !checkFileLevelRelativeToRoot(filePath, depth)
-        || !(this.javaPropsExtensions.contains(fileExtension))) {
+        || !(this.javaPropsExtensions.contains(fileExtension) || this.hoconFileExtensions.contains(fileExtension))) {
       log.warn("Changed file does not conform to directory structure and file name format, skipping: "
           + filePath);
       return false;
@@ -358,7 +362,7 @@ public class GitFlowGraphMonitor extends GitMonitoringService {
    * @throws IOException
    */
   private Config loadNodeFileWithOverrides(Path filePath) throws IOException {
-    Config nodeConfig = this.pullFileLoader.loadPullFile(filePath, emptyConfig, false);
+    Config nodeConfig = this.pullFileLoader.loadPullFile(filePath, emptyConfig, false, false);
     return getNodeConfigWithOverrides(nodeConfig, filePath);
   }
 
@@ -369,7 +373,7 @@ public class GitFlowGraphMonitor extends GitMonitoringService {
    * @throws IOException
    */
   private Config loadEdgeFileWithOverrides(Path filePath) throws IOException {
-    Config edgeConfig = this.pullFileLoader.loadPullFile(filePath, emptyConfig, false);
+    Config edgeConfig = this.pullFileLoader.loadPullFile(filePath, emptyConfig, false, false);
     return getEdgeConfigWithOverrides(edgeConfig, filePath);
   }
 

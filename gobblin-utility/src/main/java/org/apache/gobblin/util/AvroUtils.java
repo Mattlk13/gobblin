@@ -27,7 +27,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -76,7 +75,6 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import com.google.common.io.Closer;
 
 import javax.annotation.Nonnull;
@@ -97,6 +95,8 @@ public class AvroUtils {
 
   private static final String AVRO_SUFFIX = ".avro";
 
+  private static final String SCHEMA_CREATION_TIME_KEY = "CreatedOn";
+
   /**
    * Validates that the provided reader schema can be used to decode avro data written with the
    * provided writer schema.
@@ -114,6 +114,22 @@ public class AvroUtils {
     }
 
     return SchemaCompatibility.checkReaderWriterCompatibility(readerSchema, writerSchema).getType().equals(SchemaCompatibility.SchemaCompatibilityType.COMPATIBLE);
+  }
+
+  public static Schema addSchemaCreationTime(Schema inputSchema, Schema outputSchema) {
+    if (inputSchema.getProp(SCHEMA_CREATION_TIME_KEY) != null && outputSchema.getProp(SCHEMA_CREATION_TIME_KEY) == null) {
+      outputSchema.addProp(SCHEMA_CREATION_TIME_KEY, inputSchema.getProp(SCHEMA_CREATION_TIME_KEY));
+    }
+    return outputSchema;
+  }
+
+  public static String getSchemaCreationTime(Schema inputSchema) {
+    return inputSchema.getProp(SCHEMA_CREATION_TIME_KEY);
+  }
+
+  public static Schema setSchemaCreationTime(Schema inputSchema, String creationTime) {
+    inputSchema.addProp(SCHEMA_CREATION_TIME_KEY, creationTime);
+    return inputSchema;
   }
 
   public static List<Field> deepCopySchemaFields(Schema readerSchema) {
@@ -457,7 +473,7 @@ public class AvroUtils {
   }
 
   public static void writeSchemaToFile(Schema schema, Path filePath, FileSystem fs, boolean overwrite, FsPermission perm)
-    throws IOException {
+      throws IOException {
     writeSchemaToFile(schema, filePath, null, fs, overwrite, perm);
   }
 
@@ -762,6 +778,8 @@ public class AvroUtils {
           for (Schema.Field oldField : schema.getFields()) {
             Field newField = new Field(oldField.name(), switchNamespace(oldField.schema(), namespaceOverride), oldField.doc(),
                 oldField.defaultValue(), oldField.order());
+            // Copy field level properties
+            copyFieldProperties(oldField, newField);
             newFields.add(newField);
           }
         }
@@ -867,12 +885,13 @@ public class AvroUtils {
   }
 
   /**
-   * Escaping ";" and "'" character in the schema string when it is being used in DDL.
+   * Escaping "\", """, ";" and "'" character in the schema string when it is being used in DDL.
    * These characters are not allowed to show as part of column name but could possibly appear in documentation field.
    * Therefore the escaping behavior won't cause correctness issues.
    */
   public static String sanitizeSchemaString(String schemaString) {
-    return schemaString.replaceAll(";",  "\\\\;").replaceAll("'", "\\\\'");
+    return schemaString.replace("\\\\", "\\\\\\\\").replace("\\\"", "\\\\\\\"")
+        .replace(";",  "\\;").replace("'", "\\'");
   }
 
   /**
@@ -895,7 +914,7 @@ public class AvroUtils {
     List<Field> newOutputFields = Stream.concat(outputFields.stream(), fieldList.stream()).collect(Collectors.toList());
 
     Schema outputSchema = Schema.createRecord(inputSchema.getName(), inputSchema.getDoc(),
-            inputSchema.getNamespace(), inputSchema.isError());
+        inputSchema.getNamespace(), inputSchema.isError());
     outputSchema.setFields(newOutputFields);
     copyProperties(inputSchema, outputSchema);
     return outputSchema;
@@ -913,7 +932,7 @@ public class AvroUtils {
    * @return an outputRecord that contains a union of the fields in the inputRecord and the field-values in the fieldMap
    */
   public static GenericRecord decorateRecord(GenericRecord inputRecord, @Nonnull Map<String, Object> fieldMap,
-          Schema outputSchema) {
+      Schema outputSchema) {
     GenericRecord outputRecord = new GenericData.Record(outputSchema);
     inputRecord.getSchema().getFields().forEach(f -> outputRecord.put(f.name(), inputRecord.get(f.name())));
     fieldMap.forEach((key, value) -> outputRecord.put(key, value));

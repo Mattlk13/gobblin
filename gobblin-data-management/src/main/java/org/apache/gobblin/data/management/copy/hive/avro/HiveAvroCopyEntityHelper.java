@@ -19,17 +19,20 @@ package org.apache.gobblin.data.management.copy.hive.avro;
 
 import java.io.IOException;
 import java.net.URI;
-
-import com.google.common.base.Optional;
-
 import java.util.List;
 import java.util.Map;
-import lombok.extern.slf4j.Slf4j;
 
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
-import org.apache.hadoop.hive.ql.metadata.Table;
+import org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat;
+import org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat;
 import org.apache.hadoop.hive.ql.metadata.Partition;
+import org.apache.hadoop.hive.ql.metadata.Table;
+import org.apache.hadoop.hive.serde2.avro.AvroSerDe;
+
+import com.google.common.base.Optional;
+
+import lombok.extern.slf4j.Slf4j;
 
 import org.apache.gobblin.data.management.copy.hive.HiveCopyEntityHelper;
 import org.apache.gobblin.util.PathUtils;
@@ -69,7 +72,6 @@ public class HiveAvroCopyEntityHelper {
   }
 
   /**
-   *
    * @param entity, name of the entity to be changed, e.g. hive table or partition
    * @param sd, StorageDescriptor of the entity
    */
@@ -96,16 +98,16 @@ public class HiveAvroCopyEntityHelper {
 
   /**
    * Tell whether a hive table is actually an Avro table
-   * @param targetTable
-   * @return
-   * @throws IOException
+   * @param table a hive {@link Table}
+   * @return true if it is a hive table
    */
-  public static boolean isHiveTableAvroType(Table targetTable) throws IOException {
-    String serializationLib = targetTable.getTTable().getSd().getSerdeInfo().getSerializationLib();
-    String inputFormat = targetTable.getTTable().getSd().getInputFormat();
-    String outputFormat = targetTable.getTTable().getSd().getOutputFormat();
+  public static boolean isHiveTableAvroType(Table table) {
+    String serializationLib = table.getTTable().getSd().getSerdeInfo().getSerializationLib();
+    String inputFormat = table.getTTable().getSd().getInputFormat();
+    String outputFormat = table.getTTable().getSd().getOutputFormat();
 
-    return inputFormat.endsWith("AvroContainerInputFormat") || outputFormat.endsWith("AvroContainerOutputFormat")
-        || serializationLib.endsWith("AvroSerDe");
+    return inputFormat.endsWith(AvroContainerInputFormat.class.getSimpleName())
+        || outputFormat.endsWith(AvroContainerOutputFormat.class.getSimpleName())
+        || serializationLib.endsWith(AvroSerDe.class.getSimpleName());
   }
 }

@@ -21,19 +21,19 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Properties;
 
-import lombok.extern.slf4j.Slf4j;
-
 import org.joda.time.DateTime;
 import org.joda.time.Duration;
 import org.joda.time.format.ISOPeriodFormat;
 
-import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Lists;
 import com.typesafe.config.Config;
 
+import lombok.extern.slf4j.Slf4j;
+
+import org.apache.gobblin.annotation.Alias;
 import org.apache.gobblin.data.management.retention.DatasetCleaner;
 import org.apache.gobblin.data.management.version.DatasetVersion;
 import org.apache.gobblin.data.management.version.TimestampedDatasetVersion;
@@ -44,6 +44,7 @@ import org.apache.gobblin.util.ConfigUtils;
  * Retain dataset versions newer than now - {@link #retention}.
  */
 @Slf4j
+@Alias("TimeBased")
 public class TimeBasedRetentionPolicy implements RetentionPolicy<TimestampedDatasetVersion> {
 
   public static final String RETENTION_MINUTES_KEY = DatasetCleaner.CONFIGURATION_KEY_PREFIX + "minutes.retained";

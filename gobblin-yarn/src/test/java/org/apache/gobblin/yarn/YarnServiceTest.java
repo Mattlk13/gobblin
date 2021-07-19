@@ -17,13 +17,6 @@
 
 package org.apache.gobblin.yarn;
 
-import com.google.common.base.Predicate;
-import com.google.common.eventbus.EventBus;
-import com.google.common.io.Closer;
-import com.typesafe.config.Config;
-import com.typesafe.config.ConfigFactory;
-import com.typesafe.config.ConfigValueFactory;
-
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URL;
@@ -35,7 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
-import org.apache.gobblin.testing.AssertWithBackoff;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -57,6 +50,11 @@ import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.MiniYARNCluster;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+import org.apache.helix.HelixAdmin;
+import org.apache.helix.HelixDataAccessor;
+import org.apache.helix.HelixManager;
+import org.apache.helix.PropertyKey;
+import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.Assert;
@@ -64,11 +62,21 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
+import com.google.common.base.Predicate;
+import com.google.common.eventbus.EventBus;
+import com.google.common.io.Closer;
+import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigValueFactory;
+
+import org.apache.gobblin.cluster.GobblinClusterConfigurationKeys;
+import org.apache.gobblin.testing.AssertWithBackoff;
+
 
 /**
  * Tests for {@link YarnService}.
  */
-@Test(groups = {"gobblin.yarn", "disabledOnTravis"}, singleThreaded=true)
+@Test(groups = {"gobblin.yarn", "disabledOnCI"}, singleThreaded=true)
 public class YarnServiceTest {
   final Logger LOG = LoggerFactory.getLogger(YarnServiceTest.class);
 
@@ -197,7 +205,7 @@ public class YarnServiceTest {
    * Test that the dynamic config is added to the config specified when the {@link GobblinApplicationMaster}
    * is instantiated.
    */
-  @Test(groups = {"gobblin.yarn", "disabledOnTravis"})
+  @Test(groups = {"gobblin.yarn", "disabledOnCI"})
   public void testScaleUp() {
     this.yarnService.requestTargetNumberOfContainers(10, Collections.EMPTY_SET);
 
@@ -209,7 +217,7 @@ public class YarnServiceTest {
     Assert.assertEquals(this.yarnService.getMatchingRequestsList(64, 1).size(), 0);
   }
 
-  @Test(groups = {"gobblin.yarn", "disabledOnTravis"}, dependsOnMethods = "testScaleUp")
+  @Test(groups = {"gobblin.yarn", "disabledOnCI"}, dependsOnMethods = "testScaleUp")
   public void testScaleDownWithInUseInstances() {
     Set<String> inUseInstances = new HashSet<>();
 
@@ -229,7 +237,7 @@ public class YarnServiceTest {
 
   }
 
-  @Test(groups = {"gobblin.yarn", "disabledOnTravis"}, dependsOnMethods = "testScaleDownWithInUseInstances")
+  @Test(groups = {"gobblin.yarn", "disabledOnCI"}, dependsOnMethods = "testScaleDownWithInUseInstances")
   public void testScaleDown() throws Exception {
     this.yarnService.requestTargetNumberOfContainers(4, Collections.EMPTY_SET);
 
@@ -238,7 +246,7 @@ public class YarnServiceTest {
   }
 
   // Keep this test last since it interferes with the container counts in the prior tests.
-  @Test(groups = {"gobblin.yarn", "disabledOnTravis"}, dependsOnMethods = "testScaleDown")
+  @Test(groups = {"gobblin.yarn", "disabledOnCI"}, dependsOnMethods = "testScaleDown")
   public void testReleasedContainerCache() throws Exception {
     Config modifiedConfig = this.config
         .withValue(GobblinYarnConfigurationKeys.RELEASED_CONTAINERS_CACHE_EXPIRY_SECS, ConfigValueFactory.fromAnyRef("2"));
@@ -258,12 +266,11 @@ public class YarnServiceTest {
     Assert.assertTrue(yarnService.getReleasedContainerCache().getIfPresent(containerId1) == null);
   }
 
-  @Test(groups = {"gobblin.yarn", "disabledOnTravis"}, dependsOnMethods = "testReleasedContainerCache")
+  @Test(groups = {"gobblin.yarn", "disabledOnCI"}, dependsOnMethods = "testReleasedContainerCache")
   public void testBuildContainerCommand() throws Exception {
     Config modifiedConfig = this.config
         .withValue(GobblinYarnConfigurationKeys.CONTAINER_JVM_MEMORY_OVERHEAD_MBS_KEY, ConfigValueFactory.fromAnyRef("10"))
         .withValue(GobblinYarnConfigurationKeys.CONTAINER_JVM_MEMORY_XMX_RATIO_KEY, ConfigValueFactory.fromAnyRef("0.8"));
-
     TestYarnService yarnService =
         new TestYarnService(modifiedConfig, "testApp2", "appId2",
             this.clusterConf, FileSystem.getLocal(new Configuration()), this.eventBus);
@@ -282,7 +289,25 @@ public class YarnServiceTest {
    static class TestYarnService extends YarnService {
     public TestYarnService(Config config, String applicationName, String applicationId, YarnConfiguration yarnConfiguration,
         FileSystem fs, EventBus eventBus) throws Exception {
-      super(config, applicationName, applicationId, yarnConfiguration, fs, eventBus);
+      super(config, applicationName, applicationId, yarnConfiguration, fs, eventBus, getMockHelixManager(config));
+    }
+
+    private static HelixManager getMockHelixManager(Config config) {
+      HelixManager helixManager = Mockito.mock(HelixManager.class);
+      HelixAdmin helixAdmin = Mockito.mock(HelixAdmin.class);
+      HelixDataAccessor helixDataAccessor = Mockito.mock(HelixDataAccessor.class);
+      PropertyKey propertyKey = Mockito.mock(PropertyKey.class);
+      PropertyKey.Builder propertyKeyBuilder = Mockito.mock(PropertyKey.Builder.class);
+
+      Mockito.when(helixManager.getInstanceName()).thenReturn("helixInstance1");
+      Mockito.when(helixManager.getClusterName()).thenReturn(config.getString(GobblinClusterConfigurationKeys.HELIX_CLUSTER_NAME_KEY));
+      Mockito.doNothing().when(helixAdmin).enableInstance(Mockito.anyString(), Mockito.anyString(), Mockito.anyBoolean());
+      Mockito.when(helixManager.getHelixDataAccessor()).thenReturn(helixDataAccessor);
+      Mockito.when(helixDataAccessor.keyBuilder()).thenReturn(propertyKeyBuilder);
+      Mockito.when(propertyKeyBuilder.liveInstance(Mockito.anyString())).thenReturn(propertyKey);
+      Mockito.when(helixDataAccessor.getProperty(propertyKey)).thenReturn(null);
+
+      return helixManager;
     }
 
     protected ContainerLaunchContext newContainerLaunchContext(Container container, String helixInstanceName)

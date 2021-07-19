@@ -44,7 +44,7 @@ import lombok.Data;
 /**
  * A helper to dispatch callbacks to a set of listeners. The CallbacksDispatcher is responsible for
  * managing the list if listeners which implement a common interface L. Invocation happens through
- * the {@link #execCallbacks(CallbackFactory) method.
+ * the {@link #execCallbacks(CallbackFactory)} method.
  *
  * @param L     the listener type; it is strongly advised that the class implements toString() to
  *              provide useful logging
@@ -171,7 +171,7 @@ public class CallbacksDispatcher<L> implements Closeable {
         res.cancellations.put(listener, cr);
       }
       else if (cr.hasFailed()) {
-        _log.error("Callback error: " + callbacks.get(i) + " on " + listener + ":" + cr.getError());
+        _log.error("Callback error: " + callbacks.get(i) + " on " + listener + ":" + cr.getError(), cr.getError());
         res.failures.put(listener, cr);
       }
       else {

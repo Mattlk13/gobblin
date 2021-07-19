@@ -37,12 +37,10 @@ import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.Partition;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.mapred.InputFormat;
-import org.apache.hadoop.mapred.InvalidInputException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.thrift.TException;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.typesafe.config.ConfigFactory;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
@@ -53,12 +51,17 @@ import com.google.common.collect.Maps;
 import com.google.common.io.Closer;
 import com.google.gson.Gson;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
+
+import lombok.Builder;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Singular;
+import lombok.ToString;
+import lombok.extern.slf4j.Slf4j;
 
 import org.apache.gobblin.commit.CommitStep;
 import org.apache.gobblin.configuration.State;
-import org.apache.gobblin.dataset.DatasetConstants;
-import org.apache.gobblin.dataset.DatasetDescriptor;
-import org.apache.gobblin.util.ClassAliasResolver;
 import org.apache.gobblin.data.management.copy.CopyConfiguration;
 import org.apache.gobblin.data.management.copy.CopyEntity;
 import org.apache.gobblin.data.management.copy.CopyableFile;
@@ -66,6 +69,9 @@ import org.apache.gobblin.data.management.copy.OwnerAndPermission;
 import org.apache.gobblin.data.management.copy.entities.PostPublishStep;
 import org.apache.gobblin.data.management.copy.hive.avro.HiveAvroCopyEntityHelper;
 import org.apache.gobblin.data.management.partition.FileSet;
+import org.apache.gobblin.dataset.DatasetConstants;
+import org.apache.gobblin.dataset.DatasetDescriptor;
+import org.apache.gobblin.hive.HiveConstants;
 import org.apache.gobblin.hive.HiveMetastoreClientPool;
 import org.apache.gobblin.hive.HiveRegProps;
 import org.apache.gobblin.hive.HiveRegisterStep;
@@ -76,17 +82,12 @@ import org.apache.gobblin.hive.spec.HiveSpec;
 import org.apache.gobblin.hive.spec.SimpleHiveSpec;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.metrics.event.MultiTimingEvent;
+import org.apache.gobblin.util.ClassAliasResolver;
 import org.apache.gobblin.util.PathUtils;
 import org.apache.gobblin.util.commit.DeleteFileCommitStep;
+import org.apache.gobblin.util.filesystem.ModTimeDataFileVersionStrategy;
 import org.apache.gobblin.util.reflection.GobblinConstructorUtils;
 import org.apache.gobblin.util.request_allocation.PushDownRequestor;
-
-import lombok.Builder;
-import lombok.Data;
-import lombok.Getter;
-import lombok.Singular;
-import lombok.ToString;
-import lombok.extern.slf4j.Slf4j;
 
 
 /**
@@ -103,6 +104,9 @@ public class HiveCopyEntityHelper {
   public static final String UNMANAGED_DATA_POLICY_KEY =
       HiveDatasetFinder.HIVE_DATASET_PREFIX + ".unmanaged.data.conflict.policy";
   public static final String DEFAULT_UNMANAGED_DATA_POLICY = UnmanagedDataPolicy.ABORT.name();
+
+  public static final String SOURCE_METASTORE_URI_KEY =
+      HiveDatasetFinder.HIVE_DATASET_PREFIX + ".copy.target.metastore.uri";
 
   /** Target metastore URI */
   public static final String TARGET_METASTORE_URI_KEY =
@@ -140,7 +144,6 @@ public class HiveCopyEntityHelper {
    * partitions with Path containing '/Hourly/' will be kept.
    */
   public static final String HIVE_PARTITION_EXTENDED_FILTER_TYPE = HiveDatasetFinder.HIVE_DATASET_PREFIX + ".extendedFilterType";
-
   static final Gson gson = new Gson();
 
   private static final String source_client = "source_client";
@@ -167,26 +170,26 @@ public class HiveCopyEntityHelper {
 
   private final HiveDataset dataset;
   private final CopyConfiguration configuration;
-  private final FileSystem targetFs;
+  private FileSystem targetFs;
 
   private final HiveMetastoreClientPool targetClientPool;
   private final String targetDatabase;
   private final HiveRegProps hiveRegProps;
   private Optional<Table> existingTargetTable;
   private final Table targetTable;
-  private final Optional<String> targetURI;
+  private final Optional<String> sourceMetastoreURI;
+  private final Optional<String> targetMetastoreURI;
   private final ExistingEntityPolicy existingEntityPolicy;
   private final UnmanagedDataPolicy unmanagedDataPolicy;
   private final Optional<String> partitionFilter;
-  private Optional<? extends HivePartitionExtendedFilter> hivePartitionExtendedFilter;
+  private final Optional<? extends HivePartitionExtendedFilter> hivePartitionExtendedFilter;
   private final Optional<Predicate<HivePartitionFileSet>> fastPartitionSkip;
   private final Optional<Predicate<HiveCopyEntityHelper>> fastTableSkip;
-
   private final DeregisterFileDeleteMethod deleteMethod;
 
   private final Optional<CommitStep> tableRegistrationStep;
-  private final Map<List<String>, Partition> sourcePartitions;
-  private final Map<List<String>, Partition> targetPartitions;
+  private Map<List<String>, Partition> sourcePartitions;
+  private Map<List<String>, Partition> targetPartitions;
   private final boolean enforceFileSizeMatch;
   private final EventSubmitter eventSubmitter;
   @Getter
@@ -263,12 +266,14 @@ public class HiveCopyEntityHelper {
       this.dataset = dataset;
       this.configuration = configuration;
       this.targetFs = targetFs;
-
       this.targetPathHelper = new HiveTargetPathHelper(this.dataset);
       this.enforceFileSizeMatch = configuration.isEnforceFileLengthMatch();
       this.hiveRegProps = new HiveRegProps(new State(this.dataset.getProperties()));
-      this.targetURI = Optional.fromNullable(this.dataset.getProperties().getProperty(TARGET_METASTORE_URI_KEY));
-      this.targetClientPool = HiveMetastoreClientPool.get(this.dataset.getProperties(), this.targetURI);
+      this.sourceMetastoreURI =
+          Optional.fromNullable(this.dataset.getProperties().getProperty(HiveDatasetFinder.HIVE_METASTORE_URI_KEY));
+      this.targetMetastoreURI =
+          Optional.fromNullable(this.dataset.getProperties().getProperty(TARGET_METASTORE_URI_KEY));
+      this.targetClientPool = HiveMetastoreClientPool.get(this.dataset.getProperties(), this.targetMetastoreURI);
       this.targetDatabase = Optional.fromNullable(this.dataset.getProperties().getProperty(TARGET_DATABASE_KEY))
           .or(this.dataset.table.getDbName());
       this.existingEntityPolicy = ExistingEntityPolicy.valueOf(this.dataset.getProperties()
@@ -282,58 +287,14 @@ public class HiveCopyEntityHelper {
           .valueOf(this.dataset.getProperties().getProperty(DELETE_FILES_ON_DEREGISTER).toUpperCase())
           : DEFAULT_DEREGISTER_DELETE_METHOD;
 
-      if (this.dataset.getProperties().containsKey(COPY_PARTITION_FILTER_GENERATOR)) {
-        try {
-          PartitionFilterGenerator generator = GobblinConstructorUtils.invokeFirstConstructor(
-              (Class<PartitionFilterGenerator>) Class
-                  .forName(this.dataset.getProperties().getProperty(COPY_PARTITION_FILTER_GENERATOR)),
-              Lists.<Object> newArrayList(this.dataset.getProperties()), Lists.newArrayList());
-          this.partitionFilter = Optional.of(generator.getFilter(this.dataset));
-          log.info(String.format("Dynamic partition filter for table %s: %s.", this.dataset.table.getCompleteName(),
-              this.partitionFilter.get()));
-        } catch (ReflectiveOperationException roe) {
-          throw new IOException(roe);
-        }
-      } else {
-        this.partitionFilter =
-            Optional.fromNullable(this.dataset.getProperties().getProperty(COPY_PARTITIONS_FILTER_CONSTANT));
-      }
-
-      // Initialize extended partition filter
-      if ( this.dataset.getProperties().containsKey(HIVE_PARTITION_EXTENDED_FILTER_TYPE)){
-        String filterType = dataset.getProperties().getProperty(HIVE_PARTITION_EXTENDED_FILTER_TYPE);
-        try {
-          Config config = ConfigFactory.parseProperties(this.dataset.getProperties());
-          this.hivePartitionExtendedFilter =
-              Optional.of(new ClassAliasResolver<>(HivePartitionExtendedFilterFactory.class).resolveClass(filterType).newInstance().createFilter(config));
-        } catch (ReflectiveOperationException roe) {
-          log.error("Error: Could not find filter with alias " + filterType);
-          closer.close();
-          throw new IOException(roe);
-        }
-      }
-      else {
-        this.hivePartitionExtendedFilter = Optional.absent();
-      }
-
       try {
-        this.fastPartitionSkip = this.dataset.getProperties().containsKey(FAST_PARTITION_SKIP_PREDICATE)
-            ? Optional.of(GobblinConstructorUtils.invokeFirstConstructor(
-            (Class<Predicate<HivePartitionFileSet>>) Class
-                .forName(this.dataset.getProperties().getProperty(FAST_PARTITION_SKIP_PREDICATE)),
-            Lists.<Object> newArrayList(this), Lists.newArrayList()))
-            : Optional.<Predicate<HivePartitionFileSet>> absent();
-
-        this.fastTableSkip = this.dataset.getProperties().containsKey(FAST_TABLE_SKIP_PREDICATE)
-            ? Optional.of(GobblinConstructorUtils.invokeFirstConstructor(
-            (Class<Predicate<HiveCopyEntityHelper>>) Class
-                .forName(this.dataset.getProperties().getProperty(FAST_TABLE_SKIP_PREDICATE)),
-            Lists.newArrayList()))
-            : Optional.<Predicate<HiveCopyEntityHelper>> absent();
-
-      } catch (ReflectiveOperationException roe) {
+        this.partitionFilter = this.initializePartitionFilter();
+        this.hivePartitionExtendedFilter = this.initializeExtendedPartitionFilter();
+        this.fastPartitionSkip = this.initializePartitionSkipper();
+        this.fastTableSkip = this.initializeTableSkipper();
+      } catch (ReflectiveOperationException e) {
         closer.close();
-        throw new IOException(roe);
+        throw new IOException(e);
       }
 
       Map<String, HiveMetastoreClientPool> namedPools =
@@ -349,41 +310,113 @@ public class HiveCopyEntityHelper {
           this.existingTargetTable = Optional.absent();
         }
 
-        // Constructing CommitStep object for table registration
-        Path targetPath = getTargetLocation(this.dataset.fs, this.targetFs, this.dataset.table.getDataLocation(),
-            Optional.<Partition> absent());
+        Path targetPath = getTargetLocation(this.targetFs, this.dataset.table.getDataLocation(), Optional.<Partition>absent());
+        this.dataset.setDatasetPath(targetPath.toUri().getRawPath());
+
         this.targetTable = getTargetTable(this.dataset.table, targetPath);
         HiveSpec tableHiveSpec = new SimpleHiveSpec.Builder<>(targetPath)
             .withTable(HiveMetaStoreUtils.getHiveTable(this.targetTable.getTTable())).build();
 
+        // Constructing CommitStep object for table registration
         CommitStep tableRegistrationStep =
-            new HiveRegisterStep(this.targetURI, tableHiveSpec, this.hiveRegProps);
+            new HiveRegisterStep(this.targetMetastoreURI, tableHiveSpec, this.hiveRegProps);
         this.tableRegistrationStep = Optional.of(tableRegistrationStep);
 
         if (this.existingTargetTable.isPresent() && this.existingTargetTable.get().isPartitioned()) {
           checkPartitionedTableCompatibility(this.targetTable, this.existingTargetTable.get());
         }
-        if (this.dataset.table.isPartitioned()) {
-          this.sourcePartitions = HiveUtils.getPartitionsMap(multiClient.getClient(source_client), this.dataset.table,
-              this.partitionFilter, this.hivePartitionExtendedFilter);
-          HiveAvroCopyEntityHelper.updatePartitionAttributesIfAvro(this.targetTable, this.sourcePartitions, this);
-
-          // Note: this must be mutable, so we copy the map
-          this.targetPartitions =
-              this.existingTargetTable.isPresent() ? Maps.newHashMap(
-                  HiveUtils.getPartitionsMap(multiClient.getClient(target_client),
-                      this.existingTargetTable.get(), this.partitionFilter, this.hivePartitionExtendedFilter))
-                  : Maps.<List<String>, Partition> newHashMap();
-        } else {
-          this.sourcePartitions = Maps.newHashMap();
-          this.targetPartitions = Maps.newHashMap();
-        }
+        initializeSourceAndTargetTablePartitions(multiClient);
 
       } catch (TException te) {
         closer.close();
         throw new IOException("Failed to generate work units for table " + dataset.table.getCompleteName(), te);
       }
     }
+  }
+
+  /**
+   * Checks {@value COPY_PARTITION_FILTER_GENERATOR} in configuration to determine which class to use for hive filtering
+   * Default is to filter based on {@value COPY_PARTITIONS_FILTER_CONSTANT}, a constant regex
+   * @throws ReflectiveOperationException if the generator class in the configuration is not found
+   */
+  private Optional<String> initializePartitionFilter() throws ReflectiveOperationException {
+    if (this.dataset.getProperties().containsKey(COPY_PARTITION_FILTER_GENERATOR)) {
+      PartitionFilterGenerator generator = GobblinConstructorUtils.invokeFirstConstructor(
+          (Class<PartitionFilterGenerator>) Class.forName(
+              this.dataset.getProperties().getProperty(COPY_PARTITION_FILTER_GENERATOR)),
+          Lists.<Object>newArrayList(this.dataset.getProperties()), Lists.newArrayList());
+      Optional<String> partitionFilter = Optional.of(generator.getFilter(this.dataset));
+      log.info(String.format("Dynamic partition filter for table %s: %s.", this.dataset.table.getCompleteName(),
+          partitionFilter.get()));
+      return partitionFilter;
+    } else {
+      return Optional.fromNullable(this.dataset.getProperties().getProperty(COPY_PARTITIONS_FILTER_CONSTANT));
+    }
+  }
+
+  /**
+   * Checks {@value HIVE_PARTITION_EXTENDED_FILTER_TYPE} in configuration to initialize more granular filtering class
+   * Default is to use none
+   * @throws ReflectiveOperationException if the filter class in the configuration is not found
+   */
+  private Optional<HivePartitionExtendedFilter> initializeExtendedPartitionFilter() throws IOException, ReflectiveOperationException {
+    if (this.dataset.getProperties().containsKey(HIVE_PARTITION_EXTENDED_FILTER_TYPE)){
+      String filterType = dataset.getProperties().getProperty(HIVE_PARTITION_EXTENDED_FILTER_TYPE);
+      Config config = ConfigFactory.parseProperties(this.dataset.getProperties());
+      return Optional.of(new ClassAliasResolver<>(HivePartitionExtendedFilterFactory.class).resolveClass(filterType).newInstance().createFilter(config));
+    } else {
+      return Optional.absent();
+    }
+  }
+
+  /**
+   * Checks {@value FAST_PARTITION_SKIP_PREDICATE} in configuration to determine the class used to find which hive partitions to skip
+   * Default is to skip none
+   * @throws ReflectiveOperationException if class in configuration is not found
+   */
+  private Optional<Predicate<HivePartitionFileSet>> initializePartitionSkipper() throws ReflectiveOperationException {
+    return this.dataset.getProperties().containsKey(FAST_PARTITION_SKIP_PREDICATE)
+        ? Optional.of(GobblinConstructorUtils.invokeFirstConstructor(
+        (Class<Predicate<HivePartitionFileSet>>) Class
+            .forName(this.dataset.getProperties().getProperty(FAST_PARTITION_SKIP_PREDICATE)),
+        Lists.<Object> newArrayList(this), Lists.newArrayList()))
+        : Optional.<Predicate<HivePartitionFileSet>> absent();
+  }
+
+  /**
+   * Checks {@value FAST_TABLE_SKIP_PREDICATE} in configuration to determine the class used to find which hive tables to skip
+   * Default is to skip none
+   * @throws ReflectiveOperationException if class in configuration is not found
+   */
+  private Optional<Predicate<HiveCopyEntityHelper>> initializeTableSkipper() throws ReflectiveOperationException {
+    return this.dataset.getProperties().containsKey(FAST_TABLE_SKIP_PREDICATE)
+        ? Optional.of(GobblinConstructorUtils.invokeFirstConstructor(
+        (Class<Predicate<HiveCopyEntityHelper>>) Class
+            .forName(this.dataset.getProperties().getProperty(FAST_TABLE_SKIP_PREDICATE)),
+        Lists.newArrayList()))
+        : Optional.<Predicate<HiveCopyEntityHelper>> absent();
+  }
+
+  /**
+   * Initializes the corresponding source and target partitions after applying the hive partition filters
+   * @param multiClient a map of {@link IMetaStoreClient}
+   * @throws IOException if encountering a hive error when determining partitions
+   */
+  private void initializeSourceAndTargetTablePartitions(HiveMetastoreClientPool.MultiClient multiClient) throws IOException {
+    if (this.dataset.table.isPartitioned()) {
+      this.sourcePartitions = HiveUtils.getPartitionsMap(multiClient.getClient(source_client), this.dataset.table, this.partitionFilter,
+          this.hivePartitionExtendedFilter);
+      HiveAvroCopyEntityHelper.updatePartitionAttributesIfAvro(this.targetTable, this.sourcePartitions, this);
+
+      // Note: this must be mutable, so we copy the map
+      this.targetPartitions = this.existingTargetTable.isPresent() ? Maps.newHashMap(
+          HiveUtils.getPartitionsMap(multiClient.getClient(target_client), this.existingTargetTable.get(), this.partitionFilter,
+              this.hivePartitionExtendedFilter))
+          : Maps.<List<String>, Partition>newHashMap();
+    } else {
+        this.sourcePartitions = Maps.newHashMap();
+        this.targetPartitions = Maps.newHashMap();
+      }
   }
 
   /**
@@ -475,24 +508,33 @@ public class HiveCopyEntityHelper {
   private Table getTargetTable(Table originTable, Path targetLocation) throws IOException {
     try {
       Table targetTable = originTable.copy();
-
-      targetTable.setDbName(this.targetDatabase);
-      targetTable.setDataLocation(targetLocation);
-      /*
-       * Need to set the table owner as the flow executor
-       */
-      targetTable.setOwner(UserGroupInformation.getCurrentUser().getShortUserName());
-      targetTable.getTTable().putToParameters(HiveDataset.REGISTERER, GOBBLIN_DISTCP);
-      targetTable.getTTable().putToParameters(HiveDataset.REGISTRATION_GENERATION_TIME_MILLIS,
-          Long.toString(this.startTime));
-      targetTable.getTTable().unsetCreateTime();
-
+      HiveCopyEntityHelper.addMetadataToTargetTable(targetTable, targetLocation, this.targetDatabase, this.startTime);
       HiveAvroCopyEntityHelper.updateTableAttributesIfAvro(targetTable, this);
-
       return targetTable;
     } catch (HiveException he) {
       throw new IOException(he);
     }
+  }
+
+  @VisibleForTesting
+  static void addMetadataToTargetTable(Table targetTable, Path targetLocation, String targetDatabase, long startTime)
+      throws IOException {
+    targetTable.setDbName(targetDatabase);
+    targetTable.setDataLocation(targetLocation);
+    /*
+     * Need to set the table owner as the flow executor
+     */
+    targetTable.setOwner(UserGroupInformation.getCurrentUser().getShortUserName());
+    targetTable.getTTable().putToParameters(HiveDataset.REGISTERER, GOBBLIN_DISTCP);
+    targetTable.getTTable().putToParameters(HiveDataset.REGISTRATION_GENERATION_TIME_MILLIS,
+        Long.toString(startTime));
+
+    /**
+     * Only set the this constants when source table has it.
+     */
+    targetTable.getTTable().getSd().getSerdeInfo().getParameters()
+        .computeIfPresent(HiveConstants.PATH, (k,v) -> targetLocation.toString());
+    targetTable.getTTable().unsetCreateTime();
   }
 
   int addPartitionDeregisterSteps(List<CopyEntity> copyEntities, String fileSet, int initialPriority,
@@ -521,7 +563,7 @@ public class HiveCopyEntityHelper {
     }
 
     PartitionDeregisterStep deregister =
-        new PartitionDeregisterStep(table.getTTable(), partition.getTPartition(), this.targetURI, this.hiveRegProps);
+        new PartitionDeregisterStep(table.getTTable(), partition.getTPartition(), this.targetMetastoreURI, this.hiveRegProps);
     copyEntities.add(new PostPublishStep(fileSet, Maps.<String, String> newHashMap(), deregister, stepPriority++));
     return stepPriority;
   }
@@ -559,7 +601,7 @@ public class HiveCopyEntityHelper {
     }
 
     TableDeregisterStep deregister =
-        new TableDeregisterStep(table.getTTable(), this.getTargetURI(), this.getHiveRegProps());
+        new TableDeregisterStep(table.getTTable(), this.getTargetMetastoreURI(), this.getHiveRegProps());
     copyEntities.add(new PostPublishStep(fileSet, Maps.<String, String> newHashMap(), deregister, stepPriority++));
     return stepPriority;
   }
@@ -625,7 +667,7 @@ public class HiveCopyEntityHelper {
     Map<Path, FileStatus> desiredTargetExistingPaths;
     try {
       desiredTargetExistingPaths = desiredTargetLocation.getPaths();
-    } catch (InvalidInputException ioe) {
+    } catch (IOException ioe) {
       // Thrown if inputFormat cannot find location in target. Since location doesn't exist, this set is empty.
       desiredTargetExistingPaths = Maps.newHashMap();
     }
@@ -635,12 +677,18 @@ public class HiveCopyEntityHelper {
       // For each source path
       Path newPath = helper.getTargetPathHelper().getTargetPath(sourcePath.getPath(), desiredTargetLocation.getFileSystem(), partition, true);
       boolean shouldCopy = true;
+      // Can optimize by using the mod time that has already been fetched
+      boolean useDirectGetModTime = sourceLocation.versionStrategy.isPresent()
+          && sourceLocation.versionStrategy.get().getClass().getName().equals(
+              ModTimeDataFileVersionStrategy.class.getName());
+
       if (desiredTargetExistingPaths.containsKey(newPath)) {
         // If the file exists at the destination, check whether it should be replaced, if not, no need to copy
         FileStatus existingTargetStatus = desiredTargetExistingPaths.get(newPath);
-
-        Comparable srcVer = sourceLocation.versionStrategy.get().getVersion(sourcePath.getPath());
-        Comparable dstVer = desiredTargetLocation.versionStrategy.get().getVersion(existingTargetStatus.getPath());
+        Comparable srcVer = useDirectGetModTime ? sourcePath.getModificationTime() :
+            sourceLocation.versionStrategy.get().getVersion(sourcePath.getPath());
+        Comparable dstVer = useDirectGetModTime ? existingTargetStatus.getModificationTime() :
+            desiredTargetLocation.versionStrategy.get().getVersion(existingTargetStatus.getPath());
 
         // destination has higher version, skip the copy
         if (srcVer.compareTo(dstVer) <= 0) {
@@ -771,14 +819,12 @@ public class HiveCopyEntityHelper {
 
   /**
    * Compute the target location for a Hive location.
-   * @param sourceFs Source {@link FileSystem}.
    * @param path source {@link Path} in Hive location.
    * @param partition partition these paths correspond to.
    * @return transformed location in the target.
    * @throws IOException if cannot generate a single target location.
    */
-  Path getTargetLocation(FileSystem sourceFs, FileSystem targetFs, Path path, Optional<Partition> partition)
-      throws IOException {
+  Path getTargetLocation(FileSystem targetFs, Path path, Optional<Partition> partition) {
     return getTargetPathHelper().getTargetPath(path, targetFs, partition, false);
   }
 
@@ -799,14 +845,28 @@ public class HiveCopyEntityHelper {
 
   DatasetDescriptor getSourceDataset() {
     String sourceTable = dataset.getTable().getDbName() + "." + dataset.getTable().getTableName();
-    DatasetDescriptor sourceDataset = new DatasetDescriptor(DatasetConstants.PLATFORM_HIVE, sourceTable);
+
+    URI hiveMetastoreURI = null;
+    if (sourceMetastoreURI.isPresent()) {
+      hiveMetastoreURI = URI.create(sourceMetastoreURI.get());
+    }
+
+    DatasetDescriptor sourceDataset =
+        new DatasetDescriptor(DatasetConstants.PLATFORM_HIVE, hiveMetastoreURI, sourceTable);
     sourceDataset.addMetadata(DatasetConstants.FS_URI, dataset.getFs().getUri().toString());
     return sourceDataset;
   }
 
   DatasetDescriptor getDestinationDataset() {
     String destinationTable = this.getTargetDatabase() + "." + this.getTargetTable();
-    DatasetDescriptor destinationDataset = new DatasetDescriptor(DatasetConstants.PLATFORM_HIVE, destinationTable);
+
+    URI hiveMetastoreURI = null;
+    if (targetMetastoreURI.isPresent()) {
+      hiveMetastoreURI = URI.create(targetMetastoreURI.get());
+    }
+
+    DatasetDescriptor destinationDataset =
+        new DatasetDescriptor(DatasetConstants.PLATFORM_HIVE, hiveMetastoreURI, destinationTable);
     destinationDataset.addMetadata(DatasetConstants.FS_URI, this.getTargetFs().getUri().toString());
     return destinationDataset;
   }

@@ -29,7 +29,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -65,6 +65,7 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.util.Records;
+import org.apache.helix.HelixManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,7 +73,6 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.cache.Cache;
@@ -81,7 +81,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Queues;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.common.io.Closer;
@@ -98,6 +97,8 @@ import org.apache.gobblin.cluster.HelixUtils;
 import org.apache.gobblin.cluster.event.ClusterManagerShutdownRequest;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.metrics.GobblinMetrics;
+import org.apache.gobblin.metrics.MetricReporterException;
+import org.apache.gobblin.metrics.MultiReporterException;
 import org.apache.gobblin.metrics.Tag;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.util.ConfigUtils;
@@ -107,6 +108,8 @@ import org.apache.gobblin.util.executors.ScalingThreadPoolExecutor;
 import org.apache.gobblin.yarn.event.ContainerReleaseRequest;
 import org.apache.gobblin.yarn.event.ContainerShutdownRequest;
 import org.apache.gobblin.yarn.event.NewContainerRequest;
+
+import static org.apache.gobblin.yarn.GobblinYarnTaskRunner.HELIX_YARN_INSTANCE_NAME_PREFIX;
 
 
 /**
@@ -119,7 +122,7 @@ public class YarnService extends AbstractIdleService {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(YarnService.class);
 
-  private static final Splitter SPLITTER = Splitter.on(',').omitEmptyStrings().trimResults();
+  private static final String UNKNOWN_HELIX_INSTANCE = "UNKNOWN";
 
   private final String applicationName;
   private final String applicationId;
@@ -153,11 +156,12 @@ public class YarnService extends AbstractIdleService {
 
   private final Optional<String> containerJvmArgs;
   private final String containerTimezone;
+  private final HelixManager helixManager;
 
   private volatile Optional<Resource> maxResourceCapacity = Optional.absent();
 
   // Security tokens for accessing HDFS
-  private final ByteBuffer tokens;
+  private ByteBuffer tokens;
 
   private final Closer closer = Closer.create();
 
@@ -181,10 +185,10 @@ public class YarnService extends AbstractIdleService {
   // A map from Helix instance names to the number times the instances are retried to be started
   private final ConcurrentMap<String, AtomicInteger> helixInstanceRetryCount = Maps.newConcurrentMap();
 
-  // A queue of unused Helix instance names. An unused Helix instance name gets put
-  // into the queue if the container running the instance completes. Unused Helix
+  // A concurrent HashSet of unused Helix instance names. An unused Helix instance name gets put
+  // into the set if the container running the instance completes. Unused Helix
   // instance names get picked up when replacement containers get allocated.
-  private final ConcurrentLinkedQueue<String> unusedHelixInstanceNames = Queues.newConcurrentLinkedQueue();
+  private final Set<String> unusedHelixInstanceNames = ConcurrentHashMap.newKeySet();
 
   private volatile boolean shutdownInProgress = false;
 
@@ -198,13 +202,15 @@ public class YarnService extends AbstractIdleService {
   private int numRequestedContainers = 0;
 
   public YarnService(Config config, String applicationName, String applicationId, YarnConfiguration yarnConfiguration,
-      FileSystem fs, EventBus eventBus) throws Exception {
+      FileSystem fs, EventBus eventBus, HelixManager helixManager) throws Exception {
     this.applicationName = applicationName;
     this.applicationId = applicationId;
 
     this.config = config;
 
     this.eventBus = eventBus;
+
+    this.helixManager = helixManager;
 
     this.gobblinMetrics = config.getBoolean(ConfigurationKeys.METRICS_ENABLED_KEY) ?
         Optional.of(buildGobblinMetrics()) : Optional.<GobblinMetrics>absent();
@@ -379,6 +385,10 @@ public class YarnService extends AbstractIdleService {
     }
   }
 
+  public void updateToken() throws IOException{
+    this.tokens = getSecurityTokens();
+  }
+
   private GobblinMetrics buildGobblinMetrics() {
     // Create tags list
     ImmutableList.Builder<Tag<?>> tags = new ImmutableList.Builder<>();
@@ -387,7 +397,13 @@ public class YarnService extends AbstractIdleService {
 
     // Intialize Gobblin metrics and start reporters
     GobblinMetrics gobblinMetrics = GobblinMetrics.get(this.applicationId, null, tags.build());
-    gobblinMetrics.startMetricReporting(ConfigUtils.configToProperties(config));
+    try {
+      gobblinMetrics.startMetricReporting(ConfigUtils.configToProperties(config));
+    } catch (MultiReporterException ex) {
+      for (MetricReporterException e: ex.getExceptions()) {
+        LOGGER.error("Failed to start {} {} reporter.", e.getSinkType().name(), e.getReporterType().name(), e);
+      }
+    }
 
     return gobblinMetrics;
   }
@@ -484,7 +500,7 @@ public class YarnService extends AbstractIdleService {
 
   protected ContainerLaunchContext newContainerLaunchContext(Container container, String helixInstanceName)
       throws IOException {
-    Path appWorkDir = GobblinClusterUtils.getAppWorkDirPath(this.fs, this.applicationName, this.applicationId);
+    Path appWorkDir = GobblinClusterUtils.getAppWorkDirPathFromConfig(this.config, this.fs, this.applicationName, this.applicationId);
     Path containerWorkDir = new Path(appWorkDir, GobblinYarnConfigurationKeys.CONTAINER_WORK_DIR_NAME);
 
     Map<String, LocalResource> resourceMap = Maps.newHashMap();
@@ -495,9 +511,13 @@ public class YarnService extends AbstractIdleService {
         new Path(containerWorkDir, GobblinYarnConfigurationKeys.APP_FILES_DIR_NAME), resourceMap);
 
     if (this.config.hasPath(GobblinYarnConfigurationKeys.CONTAINER_FILES_REMOTE_KEY)) {
-      addRemoteAppFiles(this.config.getString(GobblinYarnConfigurationKeys.CONTAINER_FILES_REMOTE_KEY), resourceMap);
+      YarnHelixUtils.addRemoteFilesToLocalResources(this.config.getString(GobblinYarnConfigurationKeys.CONTAINER_FILES_REMOTE_KEY),
+          resourceMap, yarnConfiguration);
     }
-
+    if (this.config.hasPath(GobblinYarnConfigurationKeys.CONTAINER_ZIPS_REMOTE_KEY)) {
+      YarnHelixUtils.addRemoteZipsToLocalResources(this.config.getString(GobblinYarnConfigurationKeys.CONTAINER_ZIPS_REMOTE_KEY),
+          resourceMap, yarnConfiguration);
+    }
     ContainerLaunchContext containerLaunchContext = Records.newRecord(ContainerLaunchContext.class);
     containerLaunchContext.setLocalResources(resourceMap);
     containerLaunchContext.setEnvironment(YarnHelixUtils.getEnvironmentVariables(this.yarnConfiguration));
@@ -528,13 +548,6 @@ public class YarnService extends AbstractIdleService {
     }
   }
 
-  private void addRemoteAppFiles(String hdfsFileList, Map<String, LocalResource> resourceMap) throws IOException {
-    for (String hdfsFilePath : SPLITTER.split(hdfsFileList)) {
-      Path srcFilePath = new Path(hdfsFilePath);
-      YarnHelixUtils.addFileAsLocalResource(
-          srcFilePath.getFileSystem(this.yarnConfiguration), srcFilePath, LocalResourceType.FILE, resourceMap);
-    }
-  }
 
   private ByteBuffer getSecurityTokens() throws IOException {
     Credentials credentials = UserGroupInformation.getCurrentUser().getCredentials();
@@ -574,6 +587,8 @@ public class YarnService extends AbstractIdleService {
         .append(" ").append(GobblinYarnTaskRunner.class.getName())
         .append(" --").append(GobblinClusterConfigurationKeys.APPLICATION_NAME_OPTION_NAME)
         .append(" ").append(this.applicationName)
+        .append(" --").append(GobblinClusterConfigurationKeys.APPLICATION_ID_OPTION_NAME)
+        .append(" ").append(this.applicationId)
         .append(" --").append(GobblinClusterConfigurationKeys.HELIX_INSTANCE_NAME_OPTION_NAME)
         .append(" ").append(helixInstanceName);
 
@@ -620,8 +635,10 @@ public class YarnService extends AbstractIdleService {
    */
   protected void handleContainerCompletion(ContainerStatus containerStatus) {
     Map.Entry<Container, String> completedContainerEntry = this.containerMap.remove(containerStatus.getContainerId());
-
-    String completedInstanceName = completedContainerEntry.getValue();
+    //Get the Helix instance name for the completed container. Because callbacks are processed asynchronously, we might
+    //encounter situations where handleContainerCompletion() is called before onContainersAllocated(), resulting in the
+    //containerId missing from the containersMap.
+    String completedInstanceName = completedContainerEntry == null?  UNKNOWN_HELIX_INSTANCE : completedContainerEntry.getValue();
 
     LOGGER.info(String.format("Container %s running Helix instance %s has completed with exit status %d",
         containerStatus.getContainerId(), completedInstanceName, containerStatus.getExitStatus()));
@@ -631,51 +648,70 @@ public class YarnService extends AbstractIdleService {
           containerStatus.getContainerId(), containerStatus.getDiagnostics()));
     }
 
-    if (this.releasedContainerCache.getIfPresent(containerStatus.getContainerId()) != null) {
-      LOGGER.info("Container release requested, so not spawning a replacement for containerId {}",
-          containerStatus.getContainerId());
-      return;
+    if (containerStatus.getExitStatus() == ContainerExitStatus.ABORTED) {
+      if (this.releasedContainerCache.getIfPresent(containerStatus.getContainerId()) != null) {
+        LOGGER.info("Container release requested, so not spawning a replacement for containerId {}", containerStatus.getContainerId());
+        if (completedContainerEntry != null) {
+          LOGGER.info("Adding instance {} to the pool of unused instances", completedInstanceName);
+          this.unusedHelixInstanceNames.add(completedInstanceName);
+        }
+        return;
+      } else {
+        LOGGER.info("Container {} aborted due to lost NM", containerStatus.getContainerId());
+       // Container release was not requested. Likely, the container was running on a node on which the NM died.
+       // In this case, RM assumes that the containers are "lost", even though the container process may still be
+        // running on the node. We need to ensure that the Helix instances running on the orphaned containers
+        // are fenced off from the Helix cluster to avoid double publishing and state being committed by the
+        // instances.
+        if (!UNKNOWN_HELIX_INSTANCE.equals(completedInstanceName)) {
+          String clusterName = this.helixManager.getClusterName();
+          //Disable the orphaned instance.
+          if (HelixUtils.isInstanceLive(helixManager, completedInstanceName)) {
+            LOGGER.info("Disabling the Helix instance {}", completedInstanceName);
+            this.helixManager.getClusterManagmentTool().enableInstance(clusterName, completedInstanceName, false);
+          }
+        }
+      }
     }
 
     if (this.shutdownInProgress) {
       return;
     }
+    if(completedContainerEntry != null) {
+      this.helixInstanceRetryCount.putIfAbsent(completedInstanceName, new AtomicInteger(0));
+      int retryCount = this.helixInstanceRetryCount.get(completedInstanceName).incrementAndGet();
 
-    this.helixInstanceRetryCount.putIfAbsent(completedInstanceName, new AtomicInteger(0));
-    int retryCount =
-    	 this.helixInstanceRetryCount.get(completedInstanceName).incrementAndGet();
-
-    // Populate event metadata
-    Optional<ImmutableMap.Builder<String, String>> eventMetadataBuilder = Optional.absent();
-    if (this.eventSubmitter.isPresent()) {
-      eventMetadataBuilder = Optional.of(buildContainerStatusEventMetadata(containerStatus));
-      eventMetadataBuilder.get().put(GobblinYarnEventConstants.EventMetadata.HELIX_INSTANCE_ID, completedInstanceName);
-      eventMetadataBuilder.get().put(GobblinYarnEventConstants.EventMetadata.CONTAINER_STATUS_RETRY_ATTEMPT, retryCount + "");
-    }
-
-    if (this.helixInstanceMaxRetries > 0 && retryCount > this.helixInstanceMaxRetries) {
+      // Populate event metadata
+      Optional<ImmutableMap.Builder<String, String>> eventMetadataBuilder = Optional.absent();
       if (this.eventSubmitter.isPresent()) {
-        this.eventSubmitter.get().submit(GobblinYarnEventConstants.EventNames.HELIX_INSTANCE_COMPLETION,
-            eventMetadataBuilder.get().build());
+        eventMetadataBuilder = Optional.of(buildContainerStatusEventMetadata(containerStatus));
+        eventMetadataBuilder.get().put(GobblinYarnEventConstants.EventMetadata.HELIX_INSTANCE_ID, completedInstanceName);
+        eventMetadataBuilder.get().put(GobblinYarnEventConstants.EventMetadata.CONTAINER_STATUS_RETRY_ATTEMPT, retryCount + "");
       }
 
-      LOGGER.warn("Maximum number of retries has been achieved for Helix instance " + completedInstanceName);
-      return;
+      if (this.helixInstanceMaxRetries > 0 && retryCount > this.helixInstanceMaxRetries) {
+        if (this.eventSubmitter.isPresent()) {
+          this.eventSubmitter.get()
+              .submit(GobblinYarnEventConstants.EventNames.HELIX_INSTANCE_COMPLETION, eventMetadataBuilder.get().build());
+        }
+
+        LOGGER.warn("Maximum number of retries has been achieved for Helix instance " + completedInstanceName);
+        return;
+      }
+
+      // Add the Helix instance name of the completed container to the set of unused
+      // instance names so they can be reused by a replacement container.
+      LOGGER.info("Adding instance {} to the pool of unused instances", completedInstanceName);
+      this.unusedHelixInstanceNames.add(completedInstanceName);
+
+      if (this.eventSubmitter.isPresent()) {
+        this.eventSubmitter.get()
+            .submit(GobblinYarnEventConstants.EventNames.HELIX_INSTANCE_COMPLETION, eventMetadataBuilder.get().build());
+      }
     }
-
-    // Add the Helix instance name of the completed container to the queue of unused
-    // instance names so they can be reused by a replacement container.
-    this.unusedHelixInstanceNames.offer(completedInstanceName);
-
-    if (this.eventSubmitter.isPresent()) {
-      this.eventSubmitter.get().submit(GobblinYarnEventConstants.EventNames.HELIX_INSTANCE_COMPLETION,
-          eventMetadataBuilder.get().build());
-    }
-
-    LOGGER.info(String.format("Requesting a new container to replace %s to run Helix instance %s",
-        containerStatus.getContainerId(), completedInstanceName));
+    LOGGER.info(String.format("Requesting a new container to replace %s to run Helix instance %s", containerStatus.getContainerId(), completedInstanceName));
     this.eventBus.post(new NewContainerRequest(
-        shouldStickToTheSameNode(containerStatus.getExitStatus()) ?
+        shouldStickToTheSameNode(containerStatus.getExitStatus()) && completedContainerEntry != null ?
             Optional.of(completedContainerEntry.getKey()) : Optional.<Container>absent()));
   }
 
@@ -720,11 +756,31 @@ public class YarnService extends AbstractIdleService {
 
         LOGGER.info(String.format("Container %s has been allocated", container.getId()));
 
-        String instanceName = unusedHelixInstanceNames.poll();
+        //Iterate over the (thread-safe) set of unused instances to find the first instance that is not currently live.
+        //Once we find a candidate instance, it is removed from the set.
+        String instanceName = null;
+
+        //Ensure that updates to unusedHelixInstanceNames are visible to other threads that might concurrently
+        //invoke the callback on container allocation.
+        synchronized (this) {
+          Iterator<String> iterator = unusedHelixInstanceNames.iterator();
+          while (iterator.hasNext()) {
+            instanceName = iterator.next();
+            if (!HelixUtils.isInstanceLive(helixManager, instanceName)) {
+              iterator.remove();
+              LOGGER.info("Found an unused instance {}", instanceName);
+              break;
+            } else {
+              //Reset the instance name to null, since this instance name is live.
+              instanceName = null;
+            }
+          }
+        }
+
         if (Strings.isNullOrEmpty(instanceName)) {
           // No unused instance name, so generating a new one.
-          instanceName = HelixUtils.getHelixInstanceName(GobblinYarnTaskRunner.class.getSimpleName(),
-              helixInstanceIdGenerator.incrementAndGet());
+          instanceName = HelixUtils
+              .getHelixInstanceName(HELIX_YARN_INSTANCE_NAME_PREFIX, helixInstanceIdGenerator.incrementAndGet());
         }
 
         final String finalInstanceName = instanceName;

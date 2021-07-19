@@ -22,6 +22,7 @@ buildscript {
   apply from: 'gradle/scripts/repositories.gradle'
   apply from: 'gradle/scripts/defaultBuildProperties.gradle'
   apply from: 'gradle/scripts/computeVersions.gradle'
+  apply from: 'gradle/scripts/ci-support.gradle'
 
   apply from: file('gradle/scripts/buildscript.gradle'), to: buildscript
 
@@ -31,8 +32,10 @@ buildscript {
     classpath 'org.apache.ant:ant:1.9.4'
     classpath 'gradle.plugin.org.inferred:gradle-processors:1.1.2'
     classpath 'org.kt3k.gradle.plugin:coveralls-gradle-plugin:1.0.2'
-    classpath 'io.spring.gradle:dependency-management-plugin:0.6.0.RELEASE'
-    classpath 'me.champeau.gradle:jmh-gradle-plugin:0.4.4'
+    classpath 'io.spring.gradle:dependency-management-plugin:1.0.11.RELEASE'
+    classpath 'me.champeau.gradle:jmh-gradle-plugin:0.4.8'
+    classpath "gradle.plugin.nl.javadude.gradle.plugins:license-gradle-plugin:0.14.0"
+    classpath 'org.jfrog.buildinfo:build-info-extractor-gradle:4.20.0'
   }
 
   repositories {
@@ -40,9 +43,7 @@ buildscript {
       url "https://plugins.gradle.org/m2/"
     }
   }
-  dependencies {
-    classpath "gradle.plugin.nl.javadude.gradle.plugins:license-gradle-plugin:0.14.0"
-  }
+
 }
 
 apply plugin: "com.github.hierynomus.license"
@@ -131,12 +132,11 @@ apply from: 'gradle/scripts/sourcesJar.gradle'
 
 apply from: 'gradle/scripts/mavenPublishing.gradle'
 apply from: 'gradle/scripts/nexusPublishing.gradle'
+apply from: 'gradle/scripts/artifactoryPublishing.gradle'
 apply from: 'gradle/scripts/javaVersionCheck.gradle'
 
 apply from: 'gradle/scripts/rat.gradle'
 apply from: 'gradle/scripts/release.gradle'
-
-task wrapper(type: Wrapper) { gradleVersion = '2.13' }
 
 /*
  * Hack for upgrading pegasus to version 11.0.0. For some reason, the gradle-plugins in
@@ -148,6 +148,12 @@ allprojects {
     doFirst {
       it.codegenClasspath += files("${System.getProperty('java.home')}/../lib/tools.jar")
     }
+  }
+}
+
+task printVersionName {
+  doLast {
+    println project.version
   }
 }
 
@@ -171,6 +177,7 @@ rat {
     '**/.ruby-version',
     '**/.DS_Store/**',
     '**/.gitignore',
+    '**/.codecov_bash',
     '**/build/**',
     '**/target/**',
     '**/bin/**',
@@ -181,18 +188,21 @@ rat {
     '**/*.svg',
     '**/*.groovy',
     '**/*.yml',
+    '**/*.yaml',
     '**/*.properties',
     '**/*.conf',
     '**/*.xml',
     '**/*.md',
     '**/*.json',
     '**/*.avsc',
+    '**/*.schema',
     '**/*.ddl',
     '**/*.dml',
     '**/*.txt',
     '**/*.pull',
     '**/*.job',
     '**/*.log',
+    '**/*.log.*',
     '**/*.sql',
     '**/*.zip',
     '**/*.gz',
@@ -203,11 +213,13 @@ rat {
     '**/*.dat',
     '**/*.pem',
     '**/*.crc',
+    '**/*.gpg',
     '**/*.jst',
     '**/*.orc',
     '**/*.rc',
     '**/*.avro',
     '**/*.avro.*',
+    '**/*.proto',
     '**/*.png',
     '**/*.jpg',
     '**/*.jpeg',
@@ -216,9 +228,11 @@ rat {
     '**/*.woff',
     '**/*.woff2',
     '**/Dockerfile',
+    '**/.dockerignore',
     '**/file*',
     '**/*.epf',
     '**/*.pdsc',
+    '**/*.pdl',
     '**/*.yml',
     '**/*.inc',
     '**/*.py',
@@ -228,6 +242,8 @@ rat {
     '**/*.avro',
     '**/*.txt.*',
     '**/*.key',
+    '**/*.token',
+    '**/*.btm',
     '**/*.json.*',
     '**/*.template',
     '**/migrationConfig',
@@ -240,6 +256,8 @@ rat {
     '**/mainGeneratedRest/**',
     '**/mainGeneratedDataTemplate/**',
     '**/gen-java/**',
+    '**/gen-avro/**',
+    '**/gen-proto/**',
     '**/META-INF/**',
     '**/package-list',
     '**/WebmasterPerformanceTuningMetrics',

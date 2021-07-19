@@ -55,6 +55,7 @@ import org.testng.Assert;
 import org.testng.annotations.Test;
 
 import com.google.common.base.Optional;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
 import lombok.extern.slf4j.Slf4j;
@@ -235,8 +236,19 @@ public class AvroUtilsTest {
     String originalNamespace = "originalNamespace";
     String originalName = "originalName";
     String newNamespace = "newNamespace";
-    Schema schema = SchemaBuilder.builder(originalNamespace).record(originalName).fields().
-        requiredDouble("double").optionalFloat("float").endRecord();
+
+    Schema schema = Schema.createRecord(originalName, "", originalNamespace, false);
+    schema.addProp("prop1", "val1");
+    schema.addProp("prop2", "val2");
+    List<Schema.Field> fieldList = Lists.newArrayList();
+    Schema.Field field1 =
+        new Schema.Field("key", Schema.create(Schema.Type.LONG), "", 0L);
+    field1.addProp("primaryKey", "true");
+    fieldList.add(field1);
+    Schema.Field field2 = new Schema.Field("double", Schema.create(Schema.Type.DOUBLE), "", 0.0);
+    fieldList.add(field2);
+
+    schema.setFields(Lists.newArrayList(fieldList));
 
     Map<String, String> map = Maps.newHashMap();
     map.put(originalNamespace, newNamespace);
@@ -247,6 +259,8 @@ public class AvroUtilsTest {
     for(Schema.Field field : newSchema.getFields()) {
       Assert.assertEquals(field, schema.getField(field.name()));
     }
+
+    Assert.assertTrue(schema.getObjectProps().equals(newSchema.getObjectProps()));
   }
 
   @Test public void testSerializeAsPath() throws Exception {
@@ -272,6 +286,24 @@ public class AvroUtilsTest {
     Assert.assertEquals(actualString, expectedString);
     // Verify that there's only one slash being added.
     Assert.assertEquals(actualString.length(), invalidString.length() + 2);
+
+    // An instance of invalid string that contains a slash followed by a quote, both of which should be escaped.
+    String invalidStringWithSlash = "abc\\\"";
+    // Should have a slash before the actual slash, and a slash before the actual quote.
+    actualString = AvroUtils.sanitizeSchemaString(invalidStringWithSlash);
+    // Meaning for each slash:
+    // first two: escape in java and the actual escape the output string
+    // second pair: escape in java and the actual slash
+    // third pair: escape for the actual quote
+    // last pair: java escape slash with the actual quote.
+    expectedString = "abc\\\\\\\"";
+    Assert.assertEquals(actualString, expectedString);
+    Assert.assertEquals(actualString.length(), invalidStringWithSlash.length() + 2);
+
+    String stringWithBackslash = "\\\\d+";
+    actualString = AvroUtils.sanitizeSchemaString(stringWithBackslash);
+    Assert.assertEquals(actualString, "\\\\\\\\d+");
+    Assert.assertEquals(actualString.length(), stringWithBackslash.length() + 2);
   }
 
   public static List<GenericRecord> getRecordFromFile(String path)

@@ -26,6 +26,14 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.commons.lang.StringUtils;
+import org.apache.hadoop.fs.Path;
+
+import com.google.common.base.Optional;
+import com.google.common.base.Preconditions;
+import com.typesafe.config.Config;
+
+import lombok.extern.slf4j.Slf4j;
+
 import org.apache.gobblin.config.client.ConfigClient;
 import org.apache.gobblin.config.client.ConfigClientUtils;
 import org.apache.gobblin.config.client.api.ConfigStoreFactoryDoesNotExistsException;
@@ -37,13 +45,6 @@ import org.apache.gobblin.kafka.client.GobblinKafkaConsumerClient;
 import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.util.DatasetFilterUtils;
 import org.apache.gobblin.util.PathUtils;
-import org.apache.hadoop.fs.Path;
-
-import com.google.common.base.Optional;
-import com.google.common.base.Preconditions;
-import com.typesafe.config.Config;
-
-import lombok.extern.slf4j.Slf4j;
 
 
 @Slf4j

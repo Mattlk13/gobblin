@@ -17,6 +17,16 @@
 
 package org.apache.gobblin.publisher;
 
+import com.google.common.base.Optional;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.common.io.Closer;
+import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigRenderOptions;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -30,29 +40,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-
 import org.apache.commons.io.IOUtils;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FSDataOutputStream;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.permission.FsPermission;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.google.common.base.Optional;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import com.google.common.io.Closer;
-import com.typesafe.config.Config;
-import com.typesafe.config.ConfigFactory;
-import com.typesafe.config.ConfigRenderOptions;
-
 import org.apache.gobblin.config.ConfigBuilder;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.SourceState;
@@ -74,6 +62,15 @@ import org.apache.gobblin.writer.FsDataWriter;
 import org.apache.gobblin.writer.FsWriterMetrics;
 import org.apache.gobblin.writer.PartitionIdentifier;
 import org.apache.gobblin.writer.PartitionedDataWriter;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.apache.gobblin.util.retry.RetryerFactory.*;
 
@@ -106,6 +103,7 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
   protected final List<FileSystem> publisherFileSystemByBranches;
   protected final List<FileSystem> metaDataWriterFileSystemByBranches;
   protected final List<Optional<String>> publisherFinalDirOwnerGroupsByBranches;
+  protected final List<Optional<String>> publisherOutputDirOwnerGroupByBranches;
   protected final List<FsPermission> permissions;
   protected final Closer closer;
   protected final Closer parallelRunnerCloser;
@@ -164,6 +162,7 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
     this.publisherFileSystemByBranches = Lists.newArrayListWithCapacity(this.numBranches);
     this.metaDataWriterFileSystemByBranches = Lists.newArrayListWithCapacity(this.numBranches);
     this.publisherFinalDirOwnerGroupsByBranches = Lists.newArrayListWithCapacity(this.numBranches);
+    this.publisherOutputDirOwnerGroupByBranches = Lists.newArrayListWithCapacity(this.numBranches);
     this.permissions = Lists.newArrayListWithCapacity(this.numBranches);
     this.metadataMergers = new HashMap<>();
 
@@ -181,9 +180,11 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
       this.metaDataWriterFileSystemByBranches.add(FileSystem.get(publisherUri, conf));
 
       // The group(s) will be applied to the final publisher output directory(ies)
+      // (Deprecated) See ConfigurationKeys.DATA_PUBLISHER_FINAL_DIR_GROUP
       this.publisherFinalDirOwnerGroupsByBranches.add(Optional.fromNullable(this.getState().getProp(ForkOperatorUtils
           .getPropertyNameForBranch(ConfigurationKeys.DATA_PUBLISHER_FINAL_DIR_GROUP, this.numBranches, i))));
-
+      this.publisherOutputDirOwnerGroupByBranches.add(Optional.fromNullable(this.getState().getProp(ForkOperatorUtils
+          .getPropertyNameForBranch(ConfigurationKeys.DATA_PUBLISHER_OUTPUT_DIR_GROUP, this.numBranches, i))));
       // The permission(s) will be applied to all directories created by the publisher,
       // which do NOT include directories created by the writer and moved by the publisher.
       // The permissions of those directories are controlled by writer.file.permissions and writer.dir.permissions.
@@ -325,7 +326,7 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
   protected DatasetDescriptor createDestinationDescriptor(WorkUnitState state, int branchId) {
     Path publisherOutputDir = getPublisherOutputDir(state, branchId);
     FileSystem fs = this.publisherFileSystemByBranches.get(branchId);
-    DatasetDescriptor destination = new DatasetDescriptor(fs.getScheme(), publisherOutputDir.toString());
+    DatasetDescriptor destination = new DatasetDescriptor(fs.getScheme(), fs.getUri(), publisherOutputDir.toString());
     destination.addMetadata(DatasetConstants.FS_URI, fs.getUri().toString());
     destination.addMetadata(DatasetConstants.BRANCH, String.valueOf(branchId));
     return destination;
@@ -371,7 +372,7 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
    * This method publishes task output data for the given {@link WorkUnitState}, but if there are output data of
    * other tasks in the same folder, it may also publish those data.
    */
-  private void publishMultiTaskData(WorkUnitState state, int branchId, Set<Path> writerOutputPathsMoved)
+  protected void publishMultiTaskData(WorkUnitState state, int branchId, Set<Path> writerOutputPathsMoved)
       throws IOException {
     publishData(state, branchId, false, writerOutputPathsMoved);
     addLineageInfo(state, branchId);
@@ -399,6 +400,10 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
       // Create final output directory
       WriterUtils.mkdirsWithRecursivePermissionWithRetry(this.publisherFileSystemByBranches.get(branchId), publisherOutputDir,
           this.permissions.get(branchId), retrierConfig);
+      if(this.publisherOutputDirOwnerGroupByBranches.get(branchId).isPresent()) {
+        LOG.info(String.format("Setting path %s group to %s", publisherOutputDir.toString(), this.publisherOutputDirOwnerGroupByBranches.get(branchId).get()));
+        HadoopUtils.setGroup(this.publisherFileSystemByBranches.get(branchId), publisherOutputDir, this.publisherOutputDirOwnerGroupByBranches.get(branchId).get());
+      }
       addSingleTaskWriterOutputToExistingDir(writerOutputDir, publisherOutputDir, state, branchId, parallelRunner);
     } else {
       if (writerOutputPathsMoved.contains(writerOutputDir)) {
@@ -427,6 +432,10 @@ public class BaseDataPublisher extends SingleTaskDataPublisher {
         // Create the parent directory of the final output directory if it does not exist
         WriterUtils.mkdirsWithRecursivePermissionWithRetry(this.publisherFileSystemByBranches.get(branchId),
             publisherOutputDir.getParent(), this.permissions.get(branchId), retrierConfig);
+        if(this.publisherOutputDirOwnerGroupByBranches.get(branchId).isPresent()) {
+          LOG.info(String.format("Setting path %s group to %s", publisherOutputDir.toString(), this.publisherOutputDirOwnerGroupByBranches.get(branchId).get()));
+          HadoopUtils.setGroup(this.publisherFileSystemByBranches.get(branchId), publisherOutputDir, this.publisherOutputDirOwnerGroupByBranches.get(branchId).get());
+        }
       }
 
       movePath(parallelRunner, state, writerOutputDir, publisherOutputDir, branchId);

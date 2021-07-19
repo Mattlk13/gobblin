@@ -26,7 +26,8 @@ buildscript {
         jcenter()
     }
     dependencies {
-        classpath 'com.github.jengelman.gradle.plugins:shadow:2.0.4'
+        // Bump up shadow version to support Gradle 5.x https://github.com/johnrengelman/shadow
+        classpath 'com.github.jengelman.gradle.plugins:shadow:5.2.0'
     }
 }
 
@@ -49,11 +50,42 @@ configurations {
     exclude group: "org.apache.hadoop"
   }
 }
-
+// changed classifier of shadow Jar to ""
+// to make it the main jar since shadow jar is only used
+// This will override the main jar on ./gradlew build
 shadowJar {
   zip64 true
+  classifier ""
+
+  dependencies {
+    exclude dependency('org.slf4j:.*')
+    exclude dependency('commons-lang:.*')
+  }
+
   relocate 'org.apache.hadoop.hive', 'shadow.gobblin.orc.org.apache.hadoop.hive'
   relocate 'com.google', 'shadow.gobblin.orc.com.google'
+}
+
+// assigning a differnet classifer to the main jar
+// so that it does not override the shadow jar
+jar {
+  classifier "thin"
+}
+
+publishing.publications {
+    shadowPub(MavenPublication) {
+      artifacts = [shadowJar]
+      pom pomAttributes
+      pom.withXml addRuntimeDependenciesToPom
+    }
+}
+
+artifactory {
+    publish {
+        defaults {
+            publications('shadowPub')
+        }
+    }
 }
 
 ext.classification="library"

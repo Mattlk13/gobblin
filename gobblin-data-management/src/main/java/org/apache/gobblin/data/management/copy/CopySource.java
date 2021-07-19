@@ -366,6 +366,11 @@ public class CopySource extends AbstractSource<String, FileAwareInputStream> {
               workUnit.setProp(ConfigurationKeys.COPY_EXPECTED_SCHEMA, ((ConfigBasedDataset) this.copyableDataset).getExpectedSchema());
             }
           }
+
+          // Ensure that the writer temporary directories are contained within the dataset shard
+          String datasetPath = this.copyableDataset.getDatasetPath();
+          workUnit.setProp(ConfigurationKeys.DATASET_DESTINATION_PATH, datasetPath);
+
           serializeCopyEntity(workUnit, copyEntity);
           serializeCopyableDataset(workUnit, metadata);
           GobblinMetrics.addCustomTagToState(workUnit,

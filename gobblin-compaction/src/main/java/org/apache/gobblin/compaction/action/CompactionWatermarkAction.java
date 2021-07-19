@@ -28,6 +28,7 @@ import com.google.common.base.Optional;
 
 import lombok.extern.slf4j.Slf4j;
 
+import org.apache.gobblin.compaction.mapreduce.MRCompactor;
 import org.apache.gobblin.compaction.parser.CompactionPathParser;
 import org.apache.gobblin.compaction.verify.CompactionWatermarkChecker;
 import org.apache.gobblin.configuration.State;
@@ -56,11 +57,13 @@ public class CompactionWatermarkAction implements CompactionCompleteAction<FileS
   private State state;
   private final String defaultHiveDb;
   private final TimeIterator.Granularity granularity;
+  private final ZoneId zone;
 
   public CompactionWatermarkAction(State state) {
     this.state = state;
     defaultHiveDb = state.getProp(DEFAULT_HIVE_DB);
     granularity = TimeIterator.Granularity.valueOf(state.getProp(GRANULARITY).toUpperCase());
+    zone = ZoneId.of(state.getProp(MRCompactor.COMPACTION_TIMEZONE, MRCompactor.DEFAULT_COMPACTION_TIMEZONE));
   }
 
   @Override
@@ -78,25 +81,25 @@ public class CompactionWatermarkAction implements CompactionCompleteAction<FileS
     String hiveDb = dbAndTable.getDb();
     String hiveTable = dbAndTable.getTable();
 
-    HiveRegister hiveRegister = HiveRegister.get(state);
-    Optional<HiveTable> tableOptional = hiveRegister.getTable(hiveDb, hiveTable);
-    if (!tableOptional.isPresent()) {
-      log.info("Table {}.{} not found. Skip publishing compaction watermarks", hiveDb, hiveTable);
-      return;
-    }
+    try (HiveRegister hiveRegister = HiveRegister.get(state)) {
+      Optional<HiveTable> tableOptional = hiveRegister.getTable(hiveDb, hiveTable);
+      if (!tableOptional.isPresent()) {
+        log.info("Table {}.{} not found. Skip publishing compaction watermarks", hiveDb, hiveTable);
+        return;
+      }
 
-    HiveTable table = tableOptional.get();
-    State tableProps = table.getProps();
-    boolean shouldUpdate =
-        mayUpdateWatermark(dataset, tableProps, CompactionWatermarkChecker.COMPACTION_WATERMARK, compactionWatermark);
-    if (mayUpdateWatermark(dataset, tableProps, CompactionWatermarkChecker.COMPLETION_COMPACTION_WATERMARK,
-        completeCompactionWatermark)) {
-      shouldUpdate = true;
-    }
+      HiveTable table = tableOptional.get();
+      State tableProps = table.getProps();
+      boolean shouldUpdate = mayUpdateWatermark(dataset, tableProps, CompactionWatermarkChecker.COMPACTION_WATERMARK, compactionWatermark);
+      if (mayUpdateWatermark(dataset, tableProps, CompactionWatermarkChecker.COMPLETION_COMPACTION_WATERMARK,
+          completeCompactionWatermark)) {
+        shouldUpdate = true;
+      }
 
-    if (shouldUpdate) {
-      log.info("Alter table {}.{} to publish watermarks {}", hiveDb, hiveTable, tableProps);
-      hiveRegister.alterTable(table);
+      if (shouldUpdate) {
+        log.info("Alter table {}.{} to publish watermarks {}", hiveDb, hiveTable, tableProps);
+        hiveRegister.alterTable(table);
+      }
     }
   }
 
@@ -138,8 +141,8 @@ public class CompactionWatermarkAction implements CompactionCompleteAction<FileS
    * unit of {@link #granularity}
    */
   private long getExpectedNextWatermark(Long previousWatermark) {
-    ZonedDateTime previousWatermarkTime = ZonedDateTime.ofInstant(Instant.ofEpochMilli(previousWatermark),
-        ZoneId.systemDefault());
+    ZonedDateTime previousWatermarkTime = ZonedDateTime.ofInstant(Instant.ofEpochMilli(previousWatermark), zone);
+    // Since version 1.8, java time supports DST change in PST(America/Los_Angeles) time zone
     ZonedDateTime nextWatermarkTime = TimeIterator.inc(previousWatermarkTime, granularity, 1);
     return nextWatermarkTime.toInstant().toEpochMilli();
   }

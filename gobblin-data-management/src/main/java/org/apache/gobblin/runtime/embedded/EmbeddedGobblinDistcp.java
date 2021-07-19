@@ -23,7 +23,6 @@ import java.net.URISyntaxException;
 import org.apache.commons.cli.CommandLine;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.util.ClassUtil;
 
 import org.apache.gobblin.annotation.Alias;
 import org.apache.gobblin.configuration.ConfigurationKeys;
@@ -68,10 +67,16 @@ public class EmbeddedGobblinDistcp extends EmbeddedGobblin {
     }
   }
 
+  // For backward-compatibility, default to distcp.template
   public EmbeddedGobblinDistcp(Path from, Path to) throws JobTemplate.TemplateException, IOException {
+    this("templates/distcp.template", from, to);
+  }
+
+  // An interface to load specified template.
+  public EmbeddedGobblinDistcp(String templateLoc, Path from, Path to) throws JobTemplate.TemplateException, IOException {
     super("Distcp");
     try {
-      setTemplate(ResourceBasedJobTemplate.forResourcePath("templates/distcp.template"));
+      setTemplate(ResourceBasedJobTemplate.forResourcePath(templateLoc));
     } catch (URISyntaxException | SpecNotFoundException exc) {
       throw new RuntimeException("Could not instantiate an " + EmbeddedGobblinDistcp.class.getName(), exc);
     }

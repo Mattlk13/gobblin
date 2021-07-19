@@ -42,6 +42,8 @@ import org.apache.hadoop.mapreduce.Counters;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.JobStatus;
 import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.TaskAttemptID;
+import org.apache.hadoop.mapreduce.TaskType;
 import org.apache.hadoop.mapreduce.filecache.DistributedCache;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.map.WrappedMapper;
@@ -62,6 +64,8 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigValue;
 
+import lombok.extern.slf4j.Slf4j;
+
 import org.apache.gobblin.broker.SharedResourcesBrokerFactory;
 import org.apache.gobblin.broker.gobblin_scopes.GobblinScopeTypes;
 import org.apache.gobblin.broker.gobblin_scopes.JobScopeInstance;
@@ -74,11 +78,13 @@ import org.apache.gobblin.fsm.FiniteStateMachine;
 import org.apache.gobblin.metastore.FsStateStore;
 import org.apache.gobblin.metastore.StateStore;
 import org.apache.gobblin.metrics.GobblinMetrics;
+import org.apache.gobblin.metrics.MultiReporterException;
 import org.apache.gobblin.metrics.Tag;
 import org.apache.gobblin.metrics.event.CountEventBuilder;
 import org.apache.gobblin.metrics.event.JobEvent;
 import org.apache.gobblin.metrics.event.JobStateEventBuilder;
 import org.apache.gobblin.metrics.event.TimingEvent;
+import org.apache.gobblin.metrics.reporter.util.MetricReportUtils;
 import org.apache.gobblin.password.PasswordManager;
 import org.apache.gobblin.runtime.AbstractJobLauncher;
 import org.apache.gobblin.runtime.DynamicConfigGeneratorFactory;
@@ -93,6 +99,8 @@ import org.apache.gobblin.runtime.TaskStateTracker;
 import org.apache.gobblin.runtime.job.GobblinJobFiniteStateMachine;
 import org.apache.gobblin.runtime.job.GobblinJobFiniteStateMachine.JobFSMState;
 import org.apache.gobblin.runtime.job.GobblinJobFiniteStateMachine.StateType;
+import org.apache.gobblin.runtime.troubleshooter.AutomaticTroubleshooter;
+import org.apache.gobblin.runtime.troubleshooter.AutomaticTroubleshooterFactory;
 import org.apache.gobblin.runtime.util.JobMetrics;
 import org.apache.gobblin.runtime.util.MetricGroup;
 import org.apache.gobblin.source.workunit.MultiWorkUnit;
@@ -104,7 +112,6 @@ import org.apache.gobblin.util.JobLauncherUtils;
 import org.apache.gobblin.util.ParallelRunner;
 import org.apache.gobblin.util.SerializationUtils;
 import org.apache.gobblin.util.reflection.RestrictedFieldAccessingUtils;
-
 /**
  * An implementation of {@link JobLauncher} that launches a Gobblin job as a Hadoop MR job.
  *
@@ -119,6 +126,7 @@ import org.apache.gobblin.util.reflection.RestrictedFieldAccessingUtils;
  *
  * @author Yinan Li
  */
+@Slf4j
 public class MRJobLauncher extends AbstractJobLauncher {
 
   private static final String INTERRUPT_JOB_FILE_NAME = "_INTERRUPT_JOB";
@@ -144,6 +152,12 @@ public class MRJobLauncher extends AbstractJobLauncher {
   // since multiple Gobblin Jobs are sharing the same jar directory.
   private static final int MAXIMUM_JAR_COPY_RETRY_TIMES_DEFAULT = 5;
   private static final int WAITING_TIME_ON_IMCOMPLETE_UPLOAD = 3000;
+
+  public static final String MR_TYPE_KEY = ConfigurationKeys.METRICS_CONFIGURATIONS_PREFIX + "mr.type";
+  public static final String MAPPER_TASK_NUM_KEY = ConfigurationKeys.METRICS_CONFIGURATIONS_PREFIX + "reporting.mapper.task.num";
+  public static final String MAPPER_TASK_ATTEMPT_NUM_KEY = ConfigurationKeys.METRICS_CONFIGURATIONS_PREFIX + "reporting.mapper.task.attempt.num";
+  public static final String REDUCER_TASK_NUM_KEY = ConfigurationKeys.METRICS_CONFIGURATIONS_PREFIX + "reporting.reducer.task.num";
+  public static final String REDUCER_TASK_ATTEMPT_NUM_KEY = ConfigurationKeys.METRICS_CONFIGURATIONS_PREFIX + "reporting.reducer.task.attempt.num";
 
   private static final Splitter SPLITTER = Splitter.on(',').omitEmptyStrings().trimResults();
 
@@ -237,13 +251,16 @@ public class MRJobLauncher extends AbstractJobLauncher {
 
     this.taskStateCollectorService =
         new TaskStateCollectorService(jobProps, this.jobContext.getJobState(), this.eventBus, taskStateStore,
-            outputTaskStateDir);
+            outputTaskStateDir, getIssueRepository());
 
     this.jarFileMaximumRetry =
         jobProps.containsKey(ConfigurationKeys.MAXIMUM_JAR_COPY_RETRY_TIMES_KEY) ? Integer.parseInt(
             jobProps.getProperty(ConfigurationKeys.MAXIMUM_JAR_COPY_RETRY_TIMES_KEY))
             : MAXIMUM_JAR_COPY_RETRY_TIMES_DEFAULT;
 
+    // One of the most common user mistakes is mis-configuring the FileSystem scheme (e.g. file versus hdfs)
+    log.info("Configured fs:{}", fs);
+    log.debug("Configuration: {}", conf);
     startCancellationExecutor();
   }
 
@@ -720,9 +737,17 @@ public class MRJobLauncher extends AbstractJobLauncher {
     // A list of WorkUnits (flattened for MultiWorkUnits) to be run by this mapper
     private final List<WorkUnit> workUnits = Lists.newArrayList();
 
+    private AutomaticTroubleshooter troubleshooter;
+
     @Override
     protected void setup(Context context) {
       final State gobblinJobState = HadoopUtils.getStateFromConf(context.getConfiguration());
+      TaskAttemptID taskAttemptID = context.getTaskAttemptID();
+
+      troubleshooter =
+          AutomaticTroubleshooterFactory.createForJob(ConfigUtils.propertiesToConfig(gobblinJobState.getProperties()));
+      troubleshooter.start();
+
       try (Closer closer = Closer.create()) {
         // Default for customizedProgressEnabled is false.
         this.customizedProgressEnabled = isCustomizedProgressReportEnabled(gobblinJobState.getProperties());
@@ -769,6 +794,23 @@ public class MRJobLauncher extends AbstractJobLauncher {
         gobblinJobState.setProp(entry.getKey(), entry.getValue().unwrapped().toString());
       }
 
+      // add some more MR task related configs
+
+      String[] tokens = taskAttemptID.toString().split("_");
+      TaskType taskType = taskAttemptID.getTaskType();
+      gobblinJobState.setProp(MR_TYPE_KEY, taskType.name());
+
+      // a task attempt id should be like 'attempt_1592863931636_2371636_m_000003_4'
+      if (tokens.length == 6) {
+        if (taskType.equals(TaskType.MAP)) {
+          gobblinJobState.setProp(MAPPER_TASK_NUM_KEY, tokens[tokens.length - 2]);
+          gobblinJobState.setProp(MAPPER_TASK_ATTEMPT_NUM_KEY, tokens[tokens.length - 1]);
+        } else if (taskType.equals(TaskType.REDUCE)) {
+          gobblinJobState.setProp(REDUCER_TASK_NUM_KEY, tokens[tokens.length - 2]);
+          gobblinJobState.setProp(REDUCER_TASK_ATTEMPT_NUM_KEY, tokens[tokens.length - 1]);
+        }
+      }
+
       this.taskExecutor = new TaskExecutor(configuration);
       this.taskStateTracker = new MRTaskStateTracker(context);
       this.serviceManager = new ServiceManager(Lists.newArrayList(this.taskExecutor, this.taskStateTracker));
@@ -780,12 +822,23 @@ public class MRJobLauncher extends AbstractJobLauncher {
       }
 
       // Setup and start metrics reporting if metric reporting is enabled
-      if (Boolean.valueOf(
-          configuration.get(ConfigurationKeys.METRICS_ENABLED_KEY, ConfigurationKeys.DEFAULT_METRICS_ENABLED))) {
+      if (Boolean.parseBoolean(configuration.get(ConfigurationKeys.METRICS_ENABLED_KEY, ConfigurationKeys.DEFAULT_METRICS_ENABLED))) {
         this.jobMetrics = Optional.of(JobMetrics.get(this.jobState));
-        this.jobMetrics.get()
-            .startMetricReportingWithFileSuffix(gobblinJobState, context.getTaskAttemptID().toString());
+        try {
+          this.jobMetrics.get().startMetricReportingWithFileSuffix(gobblinJobState, taskAttemptID.toString());
+        } catch (MultiReporterException ex) {
+          //Fail the task if metric/event reporting failure is configured to be fatal.
+          boolean isMetricReportingFailureFatal = configuration.getBoolean(ConfigurationKeys.GOBBLIN_TASK_METRIC_REPORTING_FAILURE_FATAL,
+              ConfigurationKeys.DEFAULT_GOBBLIN_TASK_METRIC_REPORTING_FAILURE_FATAL);
+          boolean isEventReportingFailureFatal = configuration.getBoolean(ConfigurationKeys.GOBBLIN_TASK_EVENT_REPORTING_FAILURE_FATAL,
+                  ConfigurationKeys.DEFAULT_GOBBLIN_TASK_EVENT_REPORTING_FAILURE_FATAL);
+          if (MetricReportUtils.shouldThrowException(LOG, ex, isMetricReportingFailureFatal, isEventReportingFailureFatal)) {
+            throw new RuntimeException(ex);
+          }
+        }
       }
+
+      AbstractJobLauncher.setDefaultAuthenticator(this.jobState.getProperties());
     }
 
     @Override
@@ -827,7 +880,7 @@ public class MRJobLauncher extends AbstractJobLauncher {
         gobblinMultiTaskAttempt =
             GobblinMultiTaskAttempt.runWorkUnits(this.jobState.getJobId(), context.getTaskAttemptID().toString(),
                 this.jobState, this.workUnits, this.taskStateTracker, this.taskExecutor, this.taskStateStore,
-                multiTaskAttemptCommitPolicy, jobBroker, (gmta) -> {
+                multiTaskAttemptCommitPolicy, jobBroker, troubleshooter.getIssueRepository(), (gmta) -> {
                   try {
                     return this.fs.exists(interruptPath);
                   } catch (IOException ioe) {
@@ -842,6 +895,14 @@ public class MRJobLauncher extends AbstractJobLauncher {
               .put(context.getTaskAttemptID().toString(), gobblinMultiTaskAttempt);
         }
       } finally {
+        try {
+          troubleshooter.refineIssues();
+          troubleshooter.logIssueSummary();
+          troubleshooter.stop();
+        } catch (Exception e) {
+          LOG.error("Failed to report issues from automatic troubleshooter", e);
+        }
+
         CommitStep cleanUpCommitStep = new CommitStep() {
 
           @Override

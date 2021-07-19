@@ -19,14 +19,11 @@ package org.apache.gobblin.metastore.testing;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.net.ServerSocket;
 import java.net.URISyntaxException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.Properties;
-
-import javax.sql.DataSource;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,16 +38,20 @@ import com.wix.mysql.EmbeddedMysql;
 import com.wix.mysql.config.MysqldConfig;
 import com.wix.mysql.distribution.Version;
 
+import javax.sql.DataSource;
+
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.metastore.MetaStoreModule;
 import org.apache.gobblin.metastore.util.DatabaseJobHistoryStoreSchemaManager;
 import org.apache.gobblin.metastore.util.MySqlJdbcUrl;
+import org.apache.gobblin.util.PortUtils;
 
 
 class TestMetastoreDatabaseServer implements Closeable {
 
   private static final String INFORMATION_SCHEMA = "information_schema";
   private static final String ROOT_USER = "root";
+  private static final String ROOT_PASSWORD = "password";
   private static final String DROP_DATABASE_TEMPLATE = "DROP DATABASE IF EXISTS %s;";
   private static final String CREATE_DATABASE_TEMPLATE = "CREATE DATABASE %s CHARACTER SET = %s COLLATE = %s;";
   private static final String ADD_USER_TEMPLATE = "GRANT ALL ON %s.* TO '%s'@'%%';";
@@ -59,9 +60,9 @@ class TestMetastoreDatabaseServer implements Closeable {
   public static final String EMBEDDED_MYSQL_ENABLED_KEY = "embeddedMysqlEnabled";
   public static final String EMBEDDED_MYSQL_ENABLED_FULL_KEY =
       CONFIG_PREFIX + "." + EMBEDDED_MYSQL_ENABLED_KEY;
-  public static final String DBUSER_NAME_KEY = "dbUserName";
+  public static final String DBUSER_NAME_KEY = "testUser";
   public static final String DBUSER_NAME_FULL_KEY =  CONFIG_PREFIX + "." + DBUSER_NAME_KEY;
-  public static final String DBUSER_PASSWORD_KEY = "dbUserPassword";
+  public static final String DBUSER_PASSWORD_KEY = "testPassword";
   public static final String DBUSER_PASSWORD_FULL_KEY =  CONFIG_PREFIX + "." + DBUSER_PASSWORD_KEY;
   public static final String DBHOST_KEY = "dbHost";
   public static final String DBHOST_FULL_KEY =  CONFIG_PREFIX + "." + DBHOST_KEY;
@@ -83,7 +84,7 @@ class TestMetastoreDatabaseServer implements Closeable {
     this.dbUserName = realConfig.getString(DBUSER_NAME_KEY);
     this.dbUserPassword = realConfig.getString(DBUSER_PASSWORD_KEY);
     this.dbHost = this.embeddedMysqlEnabled ? "localhost" : realConfig.getString(DBHOST_KEY);
-    this.dbPort = this.embeddedMysqlEnabled ? chooseRandomPort() : realConfig.getInt(DBPORT_KEY);
+    this.dbPort = this.embeddedMysqlEnabled ? new PortUtils.ServerSocketPortLocator().random() : realConfig.getInt(DBPORT_KEY);
 
     this.log.error("Starting with config: embeddedMysqlEnabled={} dbUserName={} dbHost={} dbPort={}",
                   this.embeddedMysqlEnabled,
@@ -91,9 +92,10 @@ class TestMetastoreDatabaseServer implements Closeable {
                   this.dbHost,
                   this.dbPort);
 
-    config = MysqldConfig.aMysqldConfig(Version.v5_6_latest)
+    config = MysqldConfig.aMysqldConfig(Version.v8_latest)
         .withPort(this.dbPort)
         .withUser(this.dbUserName, this.dbUserPassword)
+        .withServerVariable("explicit_defaults_for_timestamp", "off")
         .build();
     if (this.embeddedMysqlEnabled) {
       testingMySqlServer = EmbeddedMysql.anEmbeddedMysql(config).start();
@@ -133,18 +135,6 @@ class TestMetastoreDatabaseServer implements Closeable {
     }
   }
 
-  private int chooseRandomPort() throws IOException {
-    ServerSocket socket = null;
-    try {
-      socket = new ServerSocket(0);
-      return socket.getLocalPort();
-    } finally {
-      if (socket != null) {
-        socket.close();
-      }
-    }
-  }
-
   MySqlJdbcUrl getJdbcUrl(String database) throws URISyntaxException {
     return getBaseJdbcUrl()
         .setPath(database)
@@ -161,9 +151,12 @@ class TestMetastoreDatabaseServer implements Closeable {
   }
 
   private MySqlJdbcUrl getInformationSchemaJdbcUrl() throws URISyntaxException {
+    // embedded mysql has an empty password by default
+    String password =  this.embeddedMysqlEnabled ? "" : ROOT_PASSWORD;
     return getBaseJdbcUrl()
         .setPath(INFORMATION_SCHEMA)
-        .setUser(ROOT_USER);
+        .setUser(ROOT_USER)
+        .setPassword(password);
   }
 
   private Optional<Connection> getConnector(MySqlJdbcUrl jdbcUrl) throws SQLException {

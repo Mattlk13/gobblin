@@ -25,12 +25,11 @@ dependencies {
   compile externalDependency.avroMapredH2
   compile externalDependency.guava
   compile externalDependency.hadoopHdfs
-  runtime externalDependency.hadoopCommon
-  runtime externalDependency.hadoopClientCore
-  runtime externalDependency.hadoopAuth
+  runtimeOnly externalDependency.hadoopCommon
+  runtimeOnly externalDependency.hadoopClientCore
+  runtimeOnly externalDependency.hadoopAuth
   compile externalDependency.hiveMetastore
   compile externalDependency.hiveExec
-  compile externalDependency.lombok
   compile externalDependency.orcMapreduce
   compile externalDependency.slf4j
 
@@ -38,11 +37,13 @@ dependencies {
   testCompile externalDependency.testng
   testCompile externalDependency.mockito
   testCompile externalDependency.assertj
+  testCompile externalDependency.slf4jToLog4j
 }
 
 configurations {
     compile {
         transitive = true
+        exclude group: "org.pentaho"
     }
     archives
 }

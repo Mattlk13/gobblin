@@ -31,10 +31,12 @@ import com.typesafe.config.Config;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.metrics.event.EventSubmitter;
+import org.apache.gobblin.metrics.event.TimingEvent;
 import org.apache.gobblin.runtime.api.JobSpec;
 import org.apache.gobblin.runtime.api.SpecProducer;
 import org.apache.gobblin.service.ExecutionStatus;
 import org.apache.gobblin.service.FlowId;
+import org.apache.gobblin.service.RequesterService;
 import org.apache.gobblin.service.modules.flowgraph.Dag;
 import org.apache.gobblin.service.modules.flowgraph.Dag.DagNode;
 import org.apache.gobblin.service.modules.orchestration.DagManager.FailureOption;
@@ -43,7 +45,8 @@ import org.apache.gobblin.util.ConfigUtils;
 
 
 public class DagManagerUtils {
-  static long NO_SLA = -1L;
+  static long DEFAULT_FLOW_SLA_MILLIS = TimeUnit.HOURS.toMillis(24);
+  static String QUOTA_KEY_SEPERATOR = ",";
 
   static FlowId getFlowId(Dag<JobExecutionPlan> dag) {
     return getFlowId(dag.getStartNodes().get(0));
@@ -66,6 +69,10 @@ public class DagManagerUtils {
 
   static long getFlowExecId(JobSpec jobSpec) {
     return jobSpec.getConfig().getLong(ConfigurationKeys.FLOW_EXECUTION_ID_KEY);
+  }
+
+  static long getFlowExecId(String dagId) {
+    return Long.parseLong(dagId.substring(dagId.lastIndexOf('_') + 1));
   }
 
   /**
@@ -91,18 +98,6 @@ public class DagManagerUtils {
 
   static String generateDagId(String flowGroup, String flowName, long flowExecutionId) {
     return Joiner.on("_").join(flowGroup, flowName, flowExecutionId);
-  }
-
-  /**
-   * Generate a FlowId from the given {@link Dag} instance.
-   * FlowId, comparing to DagId, doesn't contain FlowExecutionId so different {@link Dag} could possibly have same
-   * {@link FlowId}.
-   * @param dag
-   * @return
-   */
-  static String generateFlowIdInString(Dag<JobExecutionPlan> dag) {
-    FlowId flowId = getFlowId(dag);
-    return Joiner.on("_").join(flowId.getFlowGroup(), flowId.getFlowName());
   }
 
   /**
@@ -182,7 +177,8 @@ public class DagManagerUtils {
       DagNode<JobExecutionPlan> node = nodesToExpand.poll();
       ExecutionStatus executionStatus = getExecutionStatus(node);
       boolean addFlag = true;
-      if (executionStatus == ExecutionStatus.PENDING || executionStatus == ExecutionStatus.PENDING_RETRY) {
+      if (executionStatus == ExecutionStatus.PENDING || executionStatus == ExecutionStatus.PENDING_RETRY
+          || executionStatus == ExecutionStatus.PENDING_RESUME) {
         //Add a node to be executed next, only if all of its parent nodes are COMPLETE.
         List<DagNode<JobExecutionPlan>> parentNodes = dag.getParents(node);
         for (DagNode<JobExecutionPlan> parentNode : parentNodes) {
@@ -220,6 +216,18 @@ public class DagManagerUtils {
     return FailureOption.valueOf(failureOption);
   }
 
+  static String getSpecExecutorUri(DagNode<JobExecutionPlan> dagNode) {
+    return dagNode.getValue().getSpecExecutor().getUri().toString();
+  }
+
+  static String getSerializedRequesterList(DagNode<JobExecutionPlan> dagNode) {
+    return ConfigUtils.getString(dagNode.getValue().getJobSpec().getConfig(), RequesterService.REQUESTER_LIST, null);
+  }
+
+  static String getUserQuotaKey(String user, DagNode<JobExecutionPlan> dagNode) {
+    return user + QUOTA_KEY_SEPERATOR + getSpecExecutorUri(dagNode);
+  }
+
   /**
    * Increment the value of {@link JobExecutionPlan#currentAttempts}
    */
@@ -228,19 +236,21 @@ public class DagManagerUtils {
   }
 
   /**
-   * flow start time is assumed to be same the flow execution id which is timestamp flow request was received
+   * Flow start time is the same as the flow execution id which is the timestamp flow request was received, unless it
+   * is a resumed flow, in which case it is {@link JobExecutionPlan#getFlowStartTime()}
    * @param dagNode dag node in context
-   * @return flow execution id
+   * @return flow start time
    */
   static long getFlowStartTime(DagNode<JobExecutionPlan> dagNode) {
-    return getFlowExecId(dagNode);
+    long flowStartTime = dagNode.getValue().getFlowStartTime();
+    return flowStartTime == 0L ? getFlowExecId(dagNode) : flowStartTime;
   }
 
   /**
    * get the sla from the dag node config.
    * if time unit is not provided, it assumes time unit is minute.
    * @param dagNode dag node for which sla is to be retrieved
-   * @return sla if it is provided, {@value NO_SLA} otherwise
+   * @return sla if it is provided, DEFAULT_FLOW_SLA_MILLIS otherwise
    */
   static long getFlowSLA(DagNode<JobExecutionPlan> dagNode) {
     Config jobConfig = dagNode.getValue().getJobSpec().getConfig();
@@ -249,7 +259,7 @@ public class DagManagerUtils {
 
     return jobConfig.hasPath(ConfigurationKeys.GOBBLIN_FLOW_SLA_TIME)
         ? slaTimeUnit.toMillis(jobConfig.getLong(ConfigurationKeys.GOBBLIN_FLOW_SLA_TIME))
-        : NO_SLA;
+        : DEFAULT_FLOW_SLA_MILLIS;
   }
 
   /**
@@ -281,6 +291,14 @@ public class DagManagerUtils {
       // Every dag node will contain the same flow metadata
       Config config = dag.getNodes().get(0).getValue().getJobSpec().getConfig();
       Map<String, String> flowMetadata = TimingEventUtils.getFlowMetadata(config);
+
+      if (dag.getFlowEvent() != null) {
+        flowEvent = dag.getFlowEvent();
+      }
+      if (dag.getMessage() != null) {
+        flowMetadata.put(TimingEvent.METADATA_MESSAGE, dag.getMessage());
+      }
+
       eventSubmitter.get().getTimingEvent(flowEvent).stop(flowMetadata);
     }
   }

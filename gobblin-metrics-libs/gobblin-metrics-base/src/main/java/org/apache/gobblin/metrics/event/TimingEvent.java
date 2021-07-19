@@ -40,6 +40,7 @@ public class TimingEvent extends GobblinEventBuilder implements Closeable {
     public static final String WORK_UNITS_CREATION = "WorkUnitsCreationTimer";
     public static final String WORK_UNITS_PREPARATION = "WorkUnitsPreparationTimer";
     public static final String JOB_PENDING = "JobPending";
+    public static final String JOB_PENDING_RESUME = "JobPendingResume";
     public static final String JOB_ORCHESTRATED = "JobOrchestrated";
     public static final String JOB_PREPARE = "JobPrepareTimer";
     public static final String JOB_START = "JobStartTimer";
@@ -70,6 +71,8 @@ public class TimingEvent extends GobblinEventBuilder implements Closeable {
     public static final String FLOW_SUCCEEDED = "FlowSucceeded";
     public static final String FLOW_FAILED = "FlowFailed";
     public static final String FLOW_RUNNING = "FlowRunning";
+    public static final String FLOW_CANCELLED = "FlowCancelled";
+    public static final String FLOW_PENDING_RESUME = "FlowPendingResume";
   }
 
   public static class FlowEventConstants {
@@ -94,6 +97,7 @@ public class TimingEvent extends GobblinEventBuilder implements Closeable {
   public static final String METADATA_DURATION = "durationMillis";
   public static final String METADATA_TIMING_EVENT = "timingEvent";
   public static final String METADATA_MESSAGE = "message";
+  public static final String JOB_ORCHESTRATED_TIME = "jobOrchestratedTime";
   public static final String JOB_START_TIME = "jobStartTime";
   public static final String JOB_END_TIME = "jobEndTime";
 

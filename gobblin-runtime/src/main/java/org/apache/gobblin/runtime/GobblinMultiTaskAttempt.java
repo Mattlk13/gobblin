@@ -24,22 +24,30 @@ import java.lang.management.MemoryUsage;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
-import org.apache.gobblin.metrics.GobblinMetrics;
+import org.apache.commons.math3.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.github.rholder.retry.RetryException;
+import com.github.rholder.retry.Retryer;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Optional;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
+import com.typesafe.config.Config;
 
 import javax.annotation.Nullable;
+import lombok.Getter;
 import lombok.Setter;
 
 import org.apache.gobblin.annotation.Alpha;
@@ -58,13 +66,21 @@ import org.apache.gobblin.runtime.api.TaskEventMetadataGenerator;
 import org.apache.gobblin.runtime.task.TaskFactory;
 import org.apache.gobblin.runtime.task.TaskIFaceWrapper;
 import org.apache.gobblin.runtime.task.TaskUtils;
+import org.apache.gobblin.runtime.troubleshooter.InMemoryIssueRepository;
+import org.apache.gobblin.runtime.troubleshooter.IssueRepository;
+import org.apache.gobblin.runtime.troubleshooter.TroubleshooterException;
 import org.apache.gobblin.runtime.util.JobMetrics;
 import org.apache.gobblin.runtime.util.TaskMetrics;
 import org.apache.gobblin.source.workunit.WorkUnit;
+import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.util.Either;
 import org.apache.gobblin.util.ExecutorsUtils;
 import org.apache.gobblin.util.TaskEventMetadataUtils;
 import org.apache.gobblin.util.executors.IteratorExecutor;
+import org.apache.gobblin.util.retry.RetryerFactory;
+
+import static org.apache.gobblin.util.retry.RetryerFactory.RETRY_INTERVAL_MS;
+import static org.apache.gobblin.util.retry.RetryerFactory.RETRY_TIME_OUT_MS;
 
 
 /**
@@ -104,6 +120,10 @@ public class GobblinMultiTaskAttempt {
   @Setter
   private Predicate<GobblinMultiTaskAttempt> interruptionPredicate = (gmta) -> false;
   private List<Task> tasks;
+  @Getter
+  private volatile AtomicBoolean stopped = new AtomicBoolean(false);
+
+  private final IssueRepository issueRepository;
 
   /**
    * Additional commit steps that may be added by different launcher, and can be environment specific.
@@ -114,9 +134,19 @@ public class GobblinMultiTaskAttempt {
   public GobblinMultiTaskAttempt(Iterator<WorkUnit> workUnits, String jobId, JobState jobState,
       TaskStateTracker taskStateTracker, TaskExecutor taskExecutor, Optional<String> containerIdOptional,
       Optional<StateStore<TaskState>> taskStateStoreOptional, SharedResourcesBroker<GobblinScopeTypes> jobBroker) {
+
+    this(workUnits, jobId, jobState, taskStateTracker, taskExecutor, containerIdOptional, taskStateStoreOptional,
+         jobBroker, new InMemoryIssueRepository());
+  }
+
+  public GobblinMultiTaskAttempt(Iterator<WorkUnit> workUnits, String jobId, JobState jobState,
+      TaskStateTracker taskStateTracker, TaskExecutor taskExecutor, Optional<String> containerIdOptional,
+      Optional<StateStore<TaskState>> taskStateStoreOptional, SharedResourcesBroker<GobblinScopeTypes> jobBroker,
+      IssueRepository issueRepository) {
     super();
     this.workUnits = workUnits;
     this.jobId = jobId;
+    this.issueRepository = issueRepository;
     this.attemptId = this.getClass().getName() + "." + this.jobId;
     this.jobState = jobState;
     this.taskStateTracker = taskStateTracker;
@@ -143,7 +173,23 @@ public class GobblinMultiTaskAttempt {
     }
 
     CountUpAndDownLatch countDownLatch = new CountUpAndDownLatch(0);
-    this.tasks = runWorkUnits(countDownLatch);
+    Pair<List<Task>, Boolean> executionResult = runWorkUnits(countDownLatch);
+    this.tasks = executionResult.getFirst();
+
+    // The task attempt has already been stopped and the task list is empty. This indicates that a cancel has been
+    // invoked prior to creation of underlying Gobblin tasks. In a normal scenario, where a cancel is invoked after
+    // successful task creation, the task list is guaranteed to be non-empty and we shouldn't enter the following block.
+    if (this.tasks.isEmpty() && this.stopped.get()) {
+      return;
+    }
+
+    // Indicating task submission failure, propagating exception as it should be noticeable to job launcher.
+    // Submission failure could be task-creation failure, or state-tracker failed to be scheduled so that the actual
+    // task isn't submitted into the executor.
+    if (!executionResult.getSecond()) {
+      throw new TaskCreationException("Failing in submitting at least one task before execution.");
+    }
+
     log.info("Waiting for submitted tasks of job {} to complete in container {}...", jobId, containerIdOptional.or(""));
     try {
       while (countDownLatch.getCount() > 0) {
@@ -216,7 +262,10 @@ public class GobblinMultiTaskAttempt {
       log.error("Committing of tasks interrupted. Aborting.");
       throw new RuntimeException(ie);
     } finally {
+
+      reportTaskIssues();
       persistTaskStateStore();
+
       if (this.cleanupCommitSteps != null) {
         for (CommitStep cleanupCommitStep : this.cleanupCommitSteps) {
           log.info("Executing additional commit step.");
@@ -226,11 +275,27 @@ public class GobblinMultiTaskAttempt {
     }
   }
 
+  private void reportTaskIssues() {
+    if (issueRepository == null) {
+      log.info("Automatic troubleshooting is not configured for this task. "
+                   + "Make sure to pass issue repository to turn it on.");
+      return;
+    }
+
+    try {
+      for (Task task : this.tasks) {
+        task.getTaskState().setTaskIssues(issueRepository.getAll());
+      }
+    } catch (TroubleshooterException e) {
+      log.warn("Failed to save task issues", e);
+    }
+  }
+
   /**
    * A method that shuts down all running tasks managed by this instance.
    * TODO: Call this from the right place.
    */
-  public void shutdownTasks()
+  public synchronized void shutdownTasks()
       throws InterruptedException {
     log.info("Shutting down tasks");
     for (Task task : this.tasks) {
@@ -248,6 +313,7 @@ public class GobblinMultiTaskAttempt {
         log.info("Task {} could not be cancelled.", task.getTaskId());
       }
     }
+    this.stopped.set(true);
   }
 
   private void persistTaskStateStore()
@@ -279,11 +345,12 @@ public class GobblinMultiTaskAttempt {
     }
 
     if (hasTaskFailure) {
-      String errorMsg ="";
+      String errorMsg = String.format("Tasks in container %s failed", containerIdOptional.or(""));
       for (Task task : tasks) {
         if (task.getTaskState().contains(ConfigurationKeys.TASK_FAILURE_EXCEPTION_KEY)) {
-          errorMsg = String.format("Task %s failed due to exception: %s", task.getTaskId(),
-              task.getTaskState().getProp(ConfigurationKeys.TASK_FAILURE_EXCEPTION_KEY));
+          errorMsg = String.format("Task failed: %s (Gobblin task id %s, container id %s)",
+                                   task.getTaskState().getProp(ConfigurationKeys.TASK_FAILURE_EXCEPTION_KEY),
+                                   task.getTaskId(), containerIdOptional.or(""));
         }
 
         // If there are task failures then the tasks may be reattempted. Save a copy of the task state that is used
@@ -295,9 +362,7 @@ public class GobblinMultiTaskAttempt {
         }
       }
 
-      throw new IOException(
-          String.format("Not all tasks running in container %s completed successfully, last recorded exception[%s]",
-              containerIdOptional.or(""), errorMsg));
+      throw new IOException(errorMsg);
     }
   }
 
@@ -361,11 +426,20 @@ public class GobblinMultiTaskAttempt {
    * </p>
    *
    * @param countDownLatch a {@link java.util.concurrent.CountDownLatch} waited on for job completion
-   * @return a list of {@link Task}s from the {@link WorkUnit}s
+   * @return a list of {@link Task}s from the {@link WorkUnit}s, as well as if there's a failure in task creation
+   * which should be handled separately to avoid silently starving on certain workunit.
    */
-  private List<Task> runWorkUnits(CountUpAndDownLatch countDownLatch) {
-
+  private synchronized Pair<List<Task>, Boolean> runWorkUnits(CountUpAndDownLatch countDownLatch) {
     List<Task> tasks = Lists.newArrayList();
+    //Has the task-attempt already been cancelled? This can happen for instance when a cancellation has been invoked on
+    // the GobblinMultiTaskAttempt instance (e.g. in the case of Helix task cancellation) before the Gobblin tasks
+    // have been submitted to the underlying task executor.
+    if (this.stopped.get()) {
+      return new Pair<>(tasks, false);
+    }
+    // A flag indicating if there are any tasks not submitted successfully.
+    // Caller of this method should handle tasks with submission failures accordingly.
+    boolean areAllTasksSubmitted = true;
     while (this.workUnits.hasNext()) {
       WorkUnit workUnit = this.workUnits.next();
       String taskId = workUnit.getProp(ConfigurationKeys.TASK_ID_KEY);
@@ -393,7 +467,7 @@ public class GobblinMultiTaskAttempt {
       Task task = null;
       try {
         countDownLatch.countUp();
-        task = createTaskRunnable(workUnitState, countDownLatch);
+        task = createTaskWithRetry(workUnitState, countDownLatch);
         this.taskStateTracker.registerNewTask(task);
         task.setTaskFuture(this.taskExecutor.submit(task));
         tasks.add(task);
@@ -404,6 +478,10 @@ public class GobblinMultiTaskAttempt {
         }
 
         if (task == null) {
+          if (e instanceof RetryException) {
+            // Indicating task being null due to failure in creation even after retrying.
+            areAllTasksSubmitted = false;
+          }
           // task could not be created, so directly count down
           countDownLatch.countDown();
           log.error("Could not create task for workunit {}", workUnit, e);
@@ -411,6 +489,7 @@ public class GobblinMultiTaskAttempt {
           // Task was created and may have been registered, but not submitted, so call the
           // task state tracker task run completion directly since the task cancel does nothing if not submitted
           this.taskStateTracker.onTaskRunCompletion(task);
+          areAllTasksSubmitted = false;
           log.error("Could not submit task for workunit {}", workUnit, e);
         } else {
           // task was created and submitted, but failed later, so cancel the task to decrement the CountDownLatch
@@ -425,7 +504,7 @@ public class GobblinMultiTaskAttempt {
     eventSubmitterBuilder.addMetadata(this.taskEventMetadataGenerator.getMetadata(jobState, JobEvent.TASKS_SUBMITTED));
     eventSubmitterBuilder.build().submit(JobEvent.TASKS_SUBMITTED, "tasksCount", Long.toString(countDownLatch.getRegisteredParties()));
 
-    return tasks;
+    return new Pair<>(tasks, areAllTasksSubmitted);
   }
 
   private void printMemoryUsage() {
@@ -453,6 +532,36 @@ public class GobblinMultiTaskAttempt {
           this.taskStateTracker);
     } else {
       return new Task(taskContext, this.taskStateTracker, this.taskExecutor, Optional.of(countDownLatch));
+    }
+  }
+
+  /**
+   * As the initialization of {@link Task} could have unstable external connection which could be healed through
+   * retry, adding retry-wrapper here for the sake of fault-tolerance.
+   */
+  @VisibleForTesting
+  Task createTaskWithRetry(WorkUnitState workUnitState, CountDownLatch countDownLatch) throws RetryException {
+    Properties defaultRetryConfig = new Properties();
+    defaultRetryConfig.setProperty(RETRY_TIME_OUT_MS, TimeUnit.MINUTES.toMillis(1L) + "");
+    defaultRetryConfig.setProperty(RETRY_INTERVAL_MS, TimeUnit.SECONDS.toMillis(2L) + "");
+    Config config = ConfigUtils.propertiesToConfig(this.jobState.getProperties())
+        .withFallback(ConfigUtils.propertiesToConfig(defaultRetryConfig));
+    Retryer<Task> retryer = RetryerFactory.newInstance(config);
+    // An "effectively final" variable for counting how many retried has been done, mostly for logging purpose.
+    final AtomicInteger counter = new AtomicInteger(0);
+
+    try {
+      return retryer.call(new Callable<Task>() {
+        @Override
+        public Task call()
+            throws Exception {
+          counter.incrementAndGet();
+          log.info(String.format("Task creation attempt %s", counter.get()));
+          return createTaskRunnable(workUnitState, countDownLatch);
+        }
+      });
+    } catch (ExecutionException ee) {
+      throw new RuntimeException("Failure in executing retryer due to, ", ee);
     }
   }
 
@@ -499,7 +608,7 @@ public class GobblinMultiTaskAttempt {
     GobblinMultiTaskAttempt multiTaskAttempt =
         new GobblinMultiTaskAttempt(workUnits, jobContext.getJobId(), jobContext.getJobState(), taskStateTracker,
             taskExecutor, Optional.<String>absent(), Optional.<StateStore<TaskState>>absent(),
-            jobContext.getJobBroker());
+            jobContext.getJobBroker(), jobContext.getIssueRepository());
     multiTaskAttempt.runAndOptionallyCommitTaskAttempt(multiTaskAttemptCommitPolicy);
     return multiTaskAttempt;
   }
@@ -523,7 +632,8 @@ public class GobblinMultiTaskAttempt {
   public static GobblinMultiTaskAttempt runWorkUnits(String jobId, String containerId, JobState jobState,
       List<WorkUnit> workUnits, TaskStateTracker taskStateTracker, TaskExecutor taskExecutor,
       StateStore<TaskState> taskStateStore, CommitPolicy multiTaskAttemptCommitPolicy,
-      SharedResourcesBroker<GobblinScopeTypes> jobBroker, Predicate<GobblinMultiTaskAttempt> interruptionPredicate)
+      SharedResourcesBroker<GobblinScopeTypes> jobBroker, IssueRepository issueRepository,
+      Predicate<GobblinMultiTaskAttempt> interruptionPredicate)
       throws IOException, InterruptedException {
 
     // dump the work unit if tracking logs are enabled
@@ -534,10 +644,14 @@ public class GobblinMultiTaskAttempt {
 
     GobblinMultiTaskAttempt multiTaskAttempt =
         new GobblinMultiTaskAttempt(workUnits.iterator(), jobId, jobState, taskStateTracker, taskExecutor,
-            Optional.of(containerId), Optional.of(taskStateStore), jobBroker);
+            Optional.of(containerId), Optional.of(taskStateStore), jobBroker, issueRepository);
     multiTaskAttempt.setInterruptionPredicate(interruptionPredicate);
 
     multiTaskAttempt.runAndOptionallyCommitTaskAttempt(multiTaskAttemptCommitPolicy);
     return multiTaskAttempt;
+  }
+
+  public int getNumTasksCreated() {
+    return this.tasks.size();
   }
 }

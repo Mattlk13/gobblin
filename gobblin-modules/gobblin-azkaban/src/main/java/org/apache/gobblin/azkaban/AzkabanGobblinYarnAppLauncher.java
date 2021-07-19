@@ -17,24 +17,24 @@
 
 package org.apache.gobblin.azkaban;
 
-import java.io.File;
 import java.io.IOException;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.TimeoutException;
 
-import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Charsets;
 import com.typesafe.config.Config;
-import com.typesafe.config.ConfigRenderOptions;
+import com.typesafe.config.ConfigValueFactory;
+
+import azkaban.jobExecutor.AbstractJob;
+import lombok.Getter;
 
 import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.yarn.GobblinYarnAppLauncher;
-
-import azkaban.jobExecutor.AbstractJob;
+import org.apache.gobblin.yarn.GobblinYarnConfigurationKeys;
 
 
 /**
@@ -53,20 +53,49 @@ import azkaban.jobExecutor.AbstractJob;
  * @author Yinan Li
  */
 public class AzkabanGobblinYarnAppLauncher extends AbstractJob {
-  // if this is set then the Azkaban config will be written to the specified file path
-  public static final String AZKABAN_CONFIG_OUTPUT_PATH = "gobblin.yarn.akabanConfigOutputPath";
-
-  private static final Logger LOGGER = Logger.getLogger(AzkabanJobLauncher.class);
+  private static final Logger LOGGER = Logger.getLogger(AzkabanGobblinYarnAppLauncher.class);
 
   private final GobblinYarnAppLauncher gobblinYarnAppLauncher;
 
-  public AzkabanGobblinYarnAppLauncher(String jobId, Properties props) throws IOException {
+  @Getter
+  private final YarnConfiguration yarnConfiguration;
+
+  public AzkabanGobblinYarnAppLauncher(String jobId, Properties gobblinProps)
+      throws IOException {
     super(jobId, LOGGER);
-    Config gobblinConfig = ConfigUtils.propertiesToConfig(props);
 
-    outputConfigToFile(gobblinConfig);
+    Config gobblinConfig = ConfigUtils.propertiesToConfig(gobblinProps);
 
-    this.gobblinYarnAppLauncher = new GobblinYarnAppLauncher(gobblinConfig, new YarnConfiguration());
+    //Suppress logs from classes that emit Yarn application Id that Azkaban uses to kill the application.
+    setLogLevelForClasses(gobblinConfig);
+
+    yarnConfiguration = initYarnConf(gobblinProps);
+
+    gobblinConfig = gobblinConfig.withValue(GobblinYarnAppLauncher.GOBBLIN_YARN_APP_LAUNCHER_MODE,
+        ConfigValueFactory.fromAnyRef(GobblinYarnAppLauncher.AZKABAN_APP_LAUNCHER_MODE_KEY));
+    this.gobblinYarnAppLauncher = new GobblinYarnAppLauncher(gobblinConfig, this.yarnConfiguration);
+  }
+
+  /**
+   * Set Log Level for each class specified in the config. Class name and the corresponding log level can be specified
+   * as "a:INFO,b:ERROR", where logs of class "a" are set to INFO and logs from class "b" are set to ERROR.
+   * @param config
+   */
+  private void setLogLevelForClasses(Config config) {
+    List<String> classLogLevels = ConfigUtils.getStringList(config, GobblinYarnConfigurationKeys.GOBBLIN_YARN_AZKABAN_CLASS_LOG_LEVELS);
+
+    for (String classLogLevel: classLogLevels) {
+      String className = classLogLevel.split(":")[0];
+      Level level = Level.toLevel(classLogLevel.split(":")[1], Level.INFO);
+      Logger.getLogger(className).setLevel(level);
+    }
+  }
+
+  /**
+   * Extended class can override this method by providing their own YARN configuration.
+   */
+  protected YarnConfiguration initYarnConf(Properties gobblinProps) {
+    return new YarnConfiguration();
   }
 
   @Override
@@ -95,38 +124,6 @@ public class AzkabanGobblinYarnAppLauncher extends AbstractJob {
       this.gobblinYarnAppLauncher.stop();
     } finally {
       super.cancel();
-    }
-  }
-
-  /**
-   * Write the config to the file specified with the config key {@value AZKABAN_CONFIG_OUTPUT_PATH} if it
-   * is configured.
-   * @param config the config to output
-   * @throws IOException
-   */
-  @VisibleForTesting
-  static void outputConfigToFile(Config config) throws IOException {
-    // If a file path is specified then write the Azkaban config to that path in HOCON format.
-    // This can be used to generate an application.conf file to pass to the yarn app master and containers.
-    if (config.hasPath(AZKABAN_CONFIG_OUTPUT_PATH)) {
-      File configFile = new File(config.getString(AZKABAN_CONFIG_OUTPUT_PATH));
-      File parentDir = configFile.getParentFile();
-
-      if (parentDir != null && !parentDir.exists()) {
-        if (!parentDir.mkdirs()) {
-          throw new IOException("Error creating directories for " + parentDir);
-        }
-      }
-
-      ConfigRenderOptions configRenderOptions = ConfigRenderOptions.defaults();
-      configRenderOptions = configRenderOptions.setComments(false);
-      configRenderOptions = configRenderOptions.setOriginComments(false);
-      configRenderOptions = configRenderOptions.setFormatted(true);
-      configRenderOptions = configRenderOptions.setJson(false);
-
-      String renderedConfig = config.root().render(configRenderOptions);
-
-      FileUtils.writeStringToFile(configFile, renderedConfig, Charsets.UTF_8);
     }
   }
 }

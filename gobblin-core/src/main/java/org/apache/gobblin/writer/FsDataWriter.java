@@ -17,30 +17,18 @@
 
 package org.apache.gobblin.writer;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.util.List;
-
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileContext;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.permission.FsPermission;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.io.Closer;
-
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.List;
 import org.apache.gobblin.codec.StreamCodec;
 import org.apache.gobblin.commit.SpeculativeAttemptAwareConstruct;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.State;
-import org.apache.gobblin.dataset.DatasetConstants;
 import org.apache.gobblin.dataset.DatasetDescriptor;
 import org.apache.gobblin.dataset.Descriptor;
 import org.apache.gobblin.dataset.PartitionDescriptor;
@@ -51,6 +39,14 @@ import org.apache.gobblin.util.HadoopUtils;
 import org.apache.gobblin.util.JobConfigurationUtils;
 import org.apache.gobblin.util.WriterUtils;
 import org.apache.gobblin.util.recordcount.IngestionRecordCountProvider;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileContext;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -74,7 +70,7 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
   protected final String fileName;
   protected final FileSystem fs;
   protected final FileContext fileContext;
-  protected final Path stagingFile;
+  protected Path stagingFile;
   protected final String partitionKey;
   private final GlobalMetadata defaultMetadata;
   protected Path outputFile;
@@ -105,8 +101,8 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
     JobConfigurationUtils.putStateIntoConfiguration(properties, conf);
     this.fs = WriterUtils.getWriterFS(properties, this.numBranches, this.branchId);
     this.fileContext = FileContext.getFileContext(
-            WriterUtils.getWriterFsUri(properties, this.numBranches, this.branchId),
-            conf);
+        WriterUtils.getWriterFsUri(properties, this.numBranches, this.branchId),
+        conf);
 
     // Initialize staging/output directory
     Path writerStagingDir = this.writerAttemptIdOptional.isPresent() ? WriterUtils
@@ -135,7 +131,7 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
         ConfigurationKeys.DEFAULT_BUFFER_SIZE);
 
     this.replicationFactor = properties.getPropAsShort(ForkOperatorUtils
-        .getPropertyNameForBranch(ConfigurationKeys.WRITER_FILE_REPLICATION_FACTOR, this.numBranches, this.branchId),
+            .getPropertyNameForBranch(ConfigurationKeys.WRITER_FILE_REPLICATION_FACTOR, this.numBranches, this.branchId),
         this.fs.getDefaultReplication(this.outputFile));
 
     this.blockSize = properties.getPropAsLong(ForkOperatorUtils
@@ -168,7 +164,8 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
   public Descriptor getDataDescriptor() {
     // Dataset is resulted from WriterUtils.getWriterOutputDir(properties, this.numBranches, this.branchId)
     // The writer dataset might not be same as the published dataset
-    DatasetDescriptor datasetDescriptor = new DatasetDescriptor(fs.getScheme(), outputFile.getParent().toString());
+    DatasetDescriptor datasetDescriptor =
+        new DatasetDescriptor(fs.getScheme(), fs.getUri(), outputFile.getParent().toString());
 
     if (partitionKey == null) {
       return datasetDescriptor;
@@ -259,18 +256,18 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
 
     this.bytesWritten = Optional.of(Long.valueOf(stagingFileStatus.getLen()));
 
+    // Rename staging file to add record count before copying to output file
+    if (this.shouldIncludeRecordCountInFileName) {
+      String filePathWithRecordCount = addRecordCountToStagingFile();
+      this.stagingFile = new Path(filePathWithRecordCount);
+      this.outputFile = new Path(this.outputFile.getParent().toString(), new Path(filePathWithRecordCount).getName());
+    }
+
     LOG.info(String.format("Moving data from %s to %s", this.stagingFile, this.outputFile));
     // For the same reason as deleting the staging file if it already exists, overwrite
     // the output file if it already exists to prevent task retry from being blocked.
-    HadoopUtils.renamePath(this.fileContext, this.stagingFile, this.outputFile, true);
-
-    // The staging file is moved to the output path in commit, so rename to add record count after that
-    if (this.shouldIncludeRecordCountInFileName) {
-      String filePathWithRecordCount = addRecordCountToFileName();
-      this.properties.appendToSetProp(this.allOutputFilesPropName, filePathWithRecordCount);
-    } else {
-      this.properties.appendToSetProp(this.allOutputFilesPropName, getOutputFilePath());
-    }
+    HadoopUtils.renamePath(this.fs, this.stagingFile, this.outputFile, true);
+    this.properties.appendToSetProp(this.allOutputFilesPropName, this.outputFile.toString());
 
     FsWriterMetrics metrics = new FsWriterMetrics(
         this.id,
@@ -278,7 +275,7 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
         ImmutableSet.of(new FsWriterMetrics.FileInfo(this.outputFile.getName(), recordsWritten()))
     );
     this.properties.setProp(FS_WRITER_METRICS_KEY, metrics.toJson());
- }
+  }
 
   /**
    * {@inheritDoc}.
@@ -304,13 +301,12 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
     this.closer.close();
   }
 
-  private synchronized String addRecordCountToFileName()
+  private synchronized String addRecordCountToStagingFile()
       throws IOException {
-    String filePath = getOutputFilePath();
+    String filePath = this.stagingFile.toString();
     String filePathWithRecordCount = IngestionRecordCountProvider.constructFilePath(filePath, recordsWritten());
     LOG.info("Renaming " + filePath + " to " + filePathWithRecordCount);
-    HadoopUtils.renamePath(this.fileContext, new Path(filePath), new Path(filePathWithRecordCount), true);
-    this.outputFile = new Path(filePathWithRecordCount);
+    HadoopUtils.renamePath(this.fs, new Path(filePath), new Path(filePathWithRecordCount), true);
     return filePathWithRecordCount;
   }
 
@@ -318,12 +314,20 @@ public abstract class FsDataWriter<D> implements DataWriter<D>, FinalState, Meta
   public State getFinalState() {
     State state = new State();
 
-    state.setProp("RecordsWritten", recordsWritten());
+    try {
+      state.setProp("RecordsWritten", recordsWritten());
+    } catch (Exception exception) {
+      // If Writer fails to return recordsWritten, it might not be implemented, or implemented incorrectly.
+      // Omit property instead of failing.
+      LOG.warn("Failed to get final state recordsWritten", exception);
+    }
+
     try {
       state.setProp("BytesWritten", bytesWritten());
     } catch (Exception exception) {
       // If Writer fails to return bytesWritten, it might not be implemented, or implemented incorrectly.
       // Omit property instead of failing.
+      LOG.warn("Failed to get final state bytesWritten", exception);
     }
 
     return state;

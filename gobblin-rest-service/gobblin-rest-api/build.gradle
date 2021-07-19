@@ -112,10 +112,36 @@ artifacts {
     archives dataTemplateSourcesJar, dataTemplateJavadocJar, restClientSourcesJar, restClientJavadocJar
 }
 
+publishing.publications {
+    dataTemplate(MavenPublication) {
+      artifactId dataTemplateName
+      artifacts = [mainDataTemplateJar, dataTemplateSourcesJar, dataTemplateJavadocJar]
+      pom pomAttributes
+      pom.withXml addRuntimeDependenciesToPom
+    }
+    restClient(MavenPublication) {
+      artifactId restClientName
+      artifacts = [mainRestClientJar, restClientSourcesJar, restClientJavadocJar]
+      pom pomAttributes
+      pom.withXml addRuntimeDependenciesToPom
+    }
+}
+artifactory {
+    contextUrl = 'https://linkedin.jfrog.io/artifactory/'
+    publish {
+        defaults {
+            publications ('mavenJava', 'restClient', 'dataTemplate')
+        }
+    }
+}
+
 buildscript {
     repositories {
         mavenCentral()
         mavenLocal()
+        maven {
+            url "https://linkedin.jfrog.io/artifactory/open-source"
+        }
     }
 
     dependencies {
@@ -123,6 +149,8 @@ buildscript {
     }
 }
 
-task compileTest(dependsOn: ['compileTestGeneratedDataTemplateJava', 'compileTestJava']) << {
+task compileTest(dependsOn: ['compileTestGeneratedDataTemplateJava', 'compileTestJava']){
+    doLast {
+    }
 }
 

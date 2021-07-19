@@ -25,22 +25,30 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 
-import com.typesafe.config.Config;
+import org.apache.commons.lang.StringUtils;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.linkedin.data.template.StringMap;
+import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
-
-import org.apache.gobblin.annotation.Alpha;
-import org.apache.gobblin.configuration.ConfigurationKeys;
-import org.apache.gobblin.util.ConfigUtils;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
+import lombok.extern.slf4j.Slf4j;
+
+import org.apache.gobblin.annotation.Alpha;
+import org.apache.gobblin.configuration.ConfigurationKeys;
+import org.apache.gobblin.service.FlowConfig;
+import org.apache.gobblin.service.FlowId;
+import org.apache.gobblin.service.Schedule;
+import org.apache.gobblin.service.ServiceConfigKeys;
+import org.apache.gobblin.util.ConfigUtils;
 
 
 /**
@@ -349,16 +357,121 @@ public class FlowSpec implements Configurable, Spec {
       this.childSpecs.get().addAll(childSpecs);
       return this;
     }
-
-
   }
 
   /**
    * get the private uri as the primary key for this object.
-   * @return
+   * @return URI of the FlowSpec
    */
   public URI getUri() {
     return this.uri;
   }
 
+  public Boolean isExplain() {
+    return ConfigUtils.getBoolean(getConfig(), ConfigurationKeys.FLOW_EXPLAIN_KEY, false);
+  }
+
+  public boolean isScheduled() {
+    return getConfig().hasPath(ConfigurationKeys.JOB_SCHEDULE_KEY);
+  }
+
+  @Slf4j
+  public static class Utils {
+    private final static String URI_SCHEME = "gobblin-flow";
+    private final static String URI_AUTHORITY = null;
+    private final static String URI_PATH_SEPARATOR = "/";
+    private final static String URI_QUERY = null;
+    private final static String URI_FRAGMENT = null;
+    private final static int EXPECTED_NUM_URI_PATH_TOKENS = 3;
+
+    public static URI createFlowSpecUri(FlowId flowId)
+        throws URISyntaxException {
+      return new URI(URI_SCHEME, URI_AUTHORITY, createUriPath(flowId), URI_QUERY, URI_FRAGMENT);
+    }
+
+    private static String createUriPath(FlowId flowId) {
+      return URI_PATH_SEPARATOR + flowId.getFlowGroup() + URI_PATH_SEPARATOR + flowId.getFlowName();
+    }
+
+    /**
+     * returns the flow name from the flowUri
+     * @param flowUri FlowUri
+     * @return null if the provided flowUri is not valid
+     */
+    public static String getFlowName(URI flowUri) {
+      String[] uriTokens = flowUri.getPath().split("/");
+      if (uriTokens.length != EXPECTED_NUM_URI_PATH_TOKENS) {
+        log.error("Invalid URI {}.", flowUri);
+        return null;
+      }
+      return uriTokens[EXPECTED_NUM_URI_PATH_TOKENS - 1];
+    }
+
+    /**
+     * returns the flow group from the flowUri
+     * @param flowUri FlowUri
+     * @return null if the provided flowUri is not valid
+     */
+    public static String getFlowGroup(URI flowUri) {
+      String[] uriTokens = flowUri.getPath().split("/");
+      if (uriTokens.length != EXPECTED_NUM_URI_PATH_TOKENS) {
+        log.error("Invalid URI {}.", flowUri);
+        return null;
+      }
+      return uriTokens[EXPECTED_NUM_URI_PATH_TOKENS - 2];
+    }
+
+    /**
+     * Create a {@link FlowConfig} from a {@link Spec}.
+     * The {@link Spec} must have {@link ConfigurationKeys#FLOW_GROUP_KEY} and {@link ConfigurationKeys#FLOW_NAME_KEY} set.
+     * @param spec spec
+     * @return {@link FlowConfig}
+     */
+    public static FlowConfig toFlowConfig(Spec spec) {
+      FlowSpec flowSpec = (FlowSpec) spec;
+      FlowConfig flowConfig = new FlowConfig();
+      Properties flowProps = flowSpec.getConfigAsProperties();
+      Schedule schedule = null;
+
+      if (flowProps.containsKey(ConfigurationKeys.JOB_SCHEDULE_KEY)) {
+        schedule = new Schedule();
+        schedule.setCronSchedule(flowProps.getProperty(ConfigurationKeys.JOB_SCHEDULE_KEY));
+      }
+      if (flowProps.containsKey(ConfigurationKeys.JOB_TEMPLATE_PATH)) {
+        flowConfig.setTemplateUris(flowProps.getProperty(ConfigurationKeys.JOB_TEMPLATE_PATH));
+      } else if (flowSpec.getTemplateURIs().isPresent()) {
+        flowConfig.setTemplateUris(StringUtils.join(flowSpec.getTemplateURIs().get(), ","));
+      } else {
+        flowConfig.setTemplateUris("NA");
+      }
+      if (schedule != null) {
+        if (flowProps.containsKey(ConfigurationKeys.FLOW_RUN_IMMEDIATELY)) {
+          schedule.setRunImmediately(Boolean.valueOf(flowProps.getProperty(ConfigurationKeys.FLOW_RUN_IMMEDIATELY)));
+        }
+
+        flowConfig.setSchedule(schedule);
+      }
+
+      if (flowProps.containsKey(ConfigurationKeys.FLOW_OWNING_GROUP_KEY)) {
+        flowConfig.setOwningGroup(flowProps.getProperty(ConfigurationKeys.FLOW_OWNING_GROUP_KEY));
+      }
+
+      // remove keys that were injected as part of flowSpec creation
+      flowProps.remove(ConfigurationKeys.JOB_SCHEDULE_KEY);
+      flowProps.remove(ConfigurationKeys.JOB_TEMPLATE_PATH);
+
+      StringMap flowPropsAsStringMap = new StringMap();
+      flowPropsAsStringMap.putAll(Maps.fromProperties(flowProps));
+
+      return flowConfig.setId(new FlowId()
+          .setFlowGroup(flowProps.getProperty(ConfigurationKeys.FLOW_GROUP_KEY))
+          .setFlowName(flowProps.getProperty(ConfigurationKeys.FLOW_NAME_KEY)))
+          .setProperties(flowPropsAsStringMap);
+    }
+
+    public static int maxFlowSpecUriLength() {
+      return URI_SCHEME.length() + ":".length() // URI separator
+        + URI_PATH_SEPARATOR.length() + ServiceConfigKeys.MAX_FLOW_NAME_LENGTH + URI_PATH_SEPARATOR.length() + ServiceConfigKeys.MAX_FLOW_GROUP_LENGTH;
+    }
+  }
 }

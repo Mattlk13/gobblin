@@ -19,7 +19,6 @@ package org.apache.gobblin.runtime.fork;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
@@ -28,7 +27,6 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableList;
 import com.google.common.io.Closer;
 
 import edu.umd.cs.findbugs.annotations.SuppressWarnings;
@@ -58,6 +56,7 @@ import org.apache.gobblin.runtime.Task;
 import org.apache.gobblin.runtime.TaskContext;
 import org.apache.gobblin.runtime.TaskExecutor;
 import org.apache.gobblin.runtime.TaskState;
+import org.apache.gobblin.runtime.util.ExceptionCleanupUtils;
 import org.apache.gobblin.runtime.util.ForkMetrics;
 import org.apache.gobblin.state.ConstructState;
 import org.apache.gobblin.stream.ControlMessage;
@@ -217,7 +216,7 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
         if (r instanceof RecordEnvelope) {
           this.writer.get().writeEnvelope((RecordEnvelope) r);
         } else if (r instanceof ControlMessage) {
-          // Nack with error and reraise the error if the control messsage handling raises an error.
+          // Nack with error and reraise the error if the control message handling raises an error.
           // This is to avoid missing an ack/nack in the error path.
           try {
             this.writer.get().getMessageHandler().handleMessage((ControlMessage) r);
@@ -228,7 +227,14 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
 
           r.ack();
         }
-      }, e -> logger.error("Failed to process record.", e),
+      }, e -> {
+          // Handle writer close in error case since onComplete will not call when exception happens
+          if (this.writer.isPresent()) {
+            this.writer.get().close();
+          }
+          logger.error("Failed to process record.", e);
+          verifyAndSetForkState(ForkState.RUNNING, ForkState.FAILED);
+          },
         () -> {
           if (this.writer.isPresent()) {
             this.writer.get().close();
@@ -249,13 +255,24 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
     compareAndSetForkState(ForkState.PENDING, ForkState.RUNNING);
     try {
       processRecords();
+
+      // Close the writer now if configured. One case where this is set is to release memory from ORC writers that can
+      // have large buffers. Making this an opt-in option to avoid breaking anything that relies on keeping the writer
+      // open until commit.
+      if (this.writer.isPresent() && taskContext.getTaskState().getPropAsBoolean(
+        ConfigurationKeys.FORK_CLOSE_WRITER_ON_COMPLETION, ConfigurationKeys.DEFAULT_FORK_CLOSE_WRITER_ON_COMPLETION)) {
+        this.writer.get().close();
+      }
+
       compareAndSetForkState(ForkState.RUNNING, ForkState.SUCCEEDED);
     } catch (Throwable t) {
+      Throwable cleanedUpException = ExceptionCleanupUtils.removeEmptyWrappers(t);
+
       // Set throwable to holder first because AsynchronousFork::putRecord can pull the throwable when it detects ForkState.FAILED status.
       ForkThrowableHolder holder = Task.getForkThrowableHolder(this.broker);
-      holder.setThrowable(this.getIndex(), t);
+      holder.setThrowable(this.getIndex(), cleanedUpException);
       this.forkState.set(ForkState.FAILED);
-      this.logger.error(String.format("Fork %d of task %s failed to process data records. Set throwable in holder %s", this.index, this.taskId, holder), t);
+      this.logger.error(String.format("Fork %d of task %s failed.", this.index, this.taskId), cleanedUpException);
     } finally {
       this.cleanup();
     }
@@ -357,17 +374,16 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
   /**
    * Commit data of this {@link Fork}.
    *
-   * @throws Exception if there is anything wrong committing the data
    */
-  public boolean commit()
-      throws Exception {
+  public boolean commit() {
     try {
       if (checkDataQuality(this.convertedSchema)) {
         // Commit data if all quality checkers pass. Again, not to catch the exception
         // it may throw so the exception gets propagated to the caller of this method.
-        this.logger.debug(String.format("Committing data for fork %d of task %s", this.index, this.taskId));
+        this.logger.info(String.format("Committing data for fork %d of task %s", this.index, this.taskId));
         commitData();
         verifyAndSetForkState(ForkState.SUCCEEDED, ForkState.COMMITTED);
+        this.logger.info(String.format("Fork %d of task %s successfully committed data", this.index, this.taskId));
         return true;
       }
       this.logger.error(String.format("Fork %d of task %s failed to pass quality checking", this.index, this.taskId));
@@ -421,7 +437,8 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
   }
 
   public boolean isDone() {
-    return this.forkState.get() == ForkState.SUCCEEDED || this.forkState.get() == ForkState.FAILED;
+    return this.forkState.get() == ForkState.SUCCEEDED || this.forkState.get() == ForkState.FAILED
+        || this.forkState.get() == ForkState.COMMITTED;
   }
 
   @Override
@@ -543,7 +560,6 @@ public class Fork<S, D> implements Closeable, FinalState, RecordStreamConsumer<S
 
       writerId = this.taskId + "_" + taskStartTime;
     }
-
     DataWriterBuilder<Object, Object> builder = this.taskContext.getDataWriterBuilder(this.branches, this.index)
         .writeTo(Destination.of(this.taskContext.getDestinationType(this.branches, this.index), this.taskState))
         .writeInFormat(this.taskContext.getWriterOutputFormat(this.branches, this.index)).withWriterId(writerId)

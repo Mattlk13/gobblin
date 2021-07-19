@@ -100,8 +100,6 @@ public class SalesforceExtractor extends RestApiExtractor {
   private static final String SALESFORCE_SOAP_SERVICE = "/services/Soap/u";
   private static final Gson GSON = new Gson();
   private static final int MAX_RETRY_INTERVAL_SECS = 600;
-  private static final String FETCH_RETRY_LIMIT_KEY = "salesforce.fetchRetryLimit";
-  private static final boolean DEFAULT_BULK_API_USE_QUERY_ALL = false;
 
   private boolean pullStatus = true;
   private String nextUrl;
@@ -114,20 +112,26 @@ public class SalesforceExtractor extends RestApiExtractor {
 
   private final int pkChunkingSize;
   private final SalesforceConnector sfConnector;
+
   private final int retryLimit;
+  private final long retryInterval;
+  private final long retryExceedQuotaInterval;
 
   private final boolean bulkApiUseQueryAll;
+  private SfConfig conf;
+
 
   public SalesforceExtractor(WorkUnitState state) {
     super(state);
+    conf = new SfConfig(state.getProperties());
 
     this.sfConnector = (SalesforceConnector) this.connector;
-    this.pkChunkingSize =
-        Math.max(MIN_PK_CHUNKING_SIZE,
-            Math.min(MAX_PK_CHUNKING_SIZE, workUnitState.getPropAsInt(PARTITION_PK_CHUNKING_SIZE, DEFAULT_PK_CHUNKING_SIZE)));
+    this.pkChunkingSize = conf.pkChunkingSize;
 
-    this.bulkApiUseQueryAll = workUnitState.getPropAsBoolean(BULK_API_USE_QUERY_ALL, DEFAULT_BULK_API_USE_QUERY_ALL);
-    this.retryLimit = workUnitState.getPropAsInt(FETCH_RETRY_LIMIT_KEY, DEFAULT_FETCH_RETRY_LIMIT);
+    this.retryInterval = conf.retryInterval;
+    this.retryExceedQuotaInterval = conf.retryExceedQuotaInterval;
+    this.bulkApiUseQueryAll = conf.bulkApiUseQueryAll;
+    this.retryLimit = conf.fetchRetryLimit;
   }
 
   @Override
@@ -554,7 +558,7 @@ public class SalesforceExtractor extends RestApiExtractor {
     String jobId = workUnit.getProp(PK_CHUNKING_JOB_ID);
     String batchIdResultIdPairString = workUnit.getProp(PK_CHUNKING_BATCH_RESULT_ID_PAIRS);
     List<FileIdVO> fileIdList = this.parseBatchIdResultIdString(jobId, batchIdResultIdPairString);
-    return new ResultChainingIterator(bulkConnection, fileIdList, retryLimit);
+    return new ResultChainingIterator(bulkConnection, fileIdList, retryLimit, retryInterval, retryExceedQuotaInterval);
   }
 
   private List<FileIdVO> parseBatchIdResultIdString(String jobId, String batchIdResultIdString) {
@@ -584,7 +588,8 @@ public class SalesforceExtractor extends RestApiExtractor {
       List<FileIdVO> fileIdVoList = this.bulkResultIdList.stream()
           .map(x -> new FileIdVO(this.bulkJob.getId(), x.batchId, x.resultId))
           .collect(Collectors.toList());
-      ResultChainingIterator chainingIter = new ResultChainingIterator(this.bulkConnection, fileIdVoList, this.retryLimit);
+      ResultChainingIterator chainingIter = new ResultChainingIterator(
+          bulkConnection, fileIdVoList, retryLimit, retryInterval, retryExceedQuotaInterval);
       chainingIter.add(getSoftDeletedRecords(schema, entity, workUnit, predicateList));
       return chainingIter;
     } catch (Exception e) {

@@ -17,26 +17,23 @@
 
 package org.apache.gobblin.data.management.copy.hive;
 
-import java.io.IOException;
-import java.util.Collection;
-import java.util.List;
-import java.util.Properties;
-
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hive.ql.metadata.HiveException;
-import org.apache.hadoop.hive.ql.metadata.Partition;
-
 import com.google.common.base.Optional;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.Closer;
-
+import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.Properties;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.gobblin.data.management.copy.CopyEntity;
 import org.apache.gobblin.data.management.copy.CopyableFile;
 import org.apache.gobblin.data.management.copy.entities.PostPublishStep;
 import org.apache.gobblin.data.management.copy.entities.PrePublishStep;
 import org.apache.gobblin.dataset.DatasetDescriptor;
 import org.apache.gobblin.dataset.PartitionDescriptor;
+import org.apache.gobblin.hive.HiveConstants;
 import org.apache.gobblin.hive.HiveRegisterStep;
 import org.apache.gobblin.hive.metastore.HiveMetaStoreUtils;
 import org.apache.gobblin.hive.spec.HiveSpec;
@@ -44,9 +41,9 @@ import org.apache.gobblin.hive.spec.SimpleHiveSpec;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.metrics.event.MultiTimingEvent;
 import org.apache.gobblin.util.commit.DeleteFileCommitStep;
-
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.ql.metadata.HiveException;
+import org.apache.hadoop.hive.ql.metadata.Partition;
 
 
 /**
@@ -88,7 +85,7 @@ public class HivePartitionFileSet extends HiveFileSet {
       stepPriority = hiveCopyEntityHelper.addSharedSteps(copyEntities, fileSet, stepPriority);
 
       multiTimer.nextStage(HiveCopyEntityHelper.Stages.COMPUTE_TARGETS);
-      Path targetPath = hiveCopyEntityHelper.getTargetLocation(hiveCopyEntityHelper.getDataset().fs, hiveCopyEntityHelper.getTargetFs(),
+      Path targetPath = hiveCopyEntityHelper.getTargetLocation(hiveCopyEntityHelper.getTargetFs(),
           this.partition.getDataLocation(), Optional.of(this.partition));
       Partition targetPartition = getTargetPartition(this.partition, targetPath);
 
@@ -123,7 +120,7 @@ public class HivePartitionFileSet extends HiveFileSet {
       HiveSpec partitionHiveSpec = new SimpleHiveSpec.Builder<>(targetPath)
           .withTable(HiveMetaStoreUtils.getHiveTable(hiveCopyEntityHelper.getTargetTable().getTTable()))
           .withPartition(Optional.of(HiveMetaStoreUtils.getHivePartition(targetPartition.getTPartition()))).build();
-      HiveRegisterStep register = new HiveRegisterStep(hiveCopyEntityHelper.getTargetURI(), partitionHiveSpec,
+      HiveRegisterStep register = new HiveRegisterStep(hiveCopyEntityHelper.getTargetMetastoreURI(), partitionHiveSpec,
           hiveCopyEntityHelper.getHiveRegProps());
       copyEntities.add(new PostPublishStep(fileSet, Maps.<String, String> newHashMap(), register, stepPriority++));
 
@@ -185,6 +182,11 @@ public class HivePartitionFileSet extends HiveFileSet {
       targetPartition.getTPartition().putToParameters(HiveDataset.REGISTRATION_GENERATION_TIME_MILLIS,
           Long.toString(this.hiveCopyEntityHelper.getStartTime()));
       targetPartition.setLocation(targetLocation.toString());
+      /**
+       * Only set the this constants when source partition has it.
+       */
+      targetPartition.getTPartition().getSd().getSerdeInfo().getParameters()
+          .computeIfPresent(HiveConstants.PATH, (k,v) -> targetLocation.toString());
       targetPartition.getTPartition().unsetCreateTime();
       return targetPartition;
     } catch (HiveException he) {

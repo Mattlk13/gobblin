@@ -77,7 +77,7 @@ public class MysqlStateStore<T extends State> implements StateStore<T> {
 
   // Class of the state objects to be put into the store
   private final Class<T> stateClass;
-  private final DataSource dataSource;
+  protected final DataSource dataSource;
   private final boolean compressedValues;
 
   private static final String UPSERT_JOB_STATE_TEMPLATE =
@@ -133,7 +133,7 @@ public class MysqlStateStore<T extends State> implements StateStore<T> {
   private final String DELETE_JOB_STATE_SQL;
   private final String CLONE_JOB_STATE_SQL;
   private final String SELECT_STORE_NAMES_SQL;
-  private final String SELECT_METADATA_SQL;
+  protected final String SELECT_METADATA_SQL;
 
   /**
    * Manages the persistence and retrieval of {@link State} in a MySQL database
@@ -162,13 +162,17 @@ public class MysqlStateStore<T extends State> implements StateStore<T> {
     SELECT_METADATA_SQL = SELECT_METADATA_TEMPLATE.replace("$TABLE$", stateStoreTableName);
 
     // create table if it does not exist
-    String createJobTable = CREATE_JOB_STATE_TABLE_TEMPLATE.replace("$TABLE$", stateStoreTableName);
+    String createJobTable = getCreateJobStateTableTemplate().replace("$TABLE$", stateStoreTableName);
     try (Connection connection = dataSource.getConnection();
         PreparedStatement createStatement = connection.prepareStatement(createJobTable)) {
       createStatement.executeUpdate();
     } catch (SQLException e) {
       throw new IOException("Failure creation table " + stateStoreTableName, e);
     }
+  }
+
+  protected String getCreateJobStateTableTemplate() {
+    return CREATE_JOB_STATE_TABLE_TEMPLATE;
   }
 
   /**

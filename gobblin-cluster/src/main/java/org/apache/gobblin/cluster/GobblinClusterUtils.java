@@ -17,26 +17,98 @@
 
 package org.apache.gobblin.cluster;
 
+import java.io.IOException;
 import java.net.InetAddress;
+import java.net.URI;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.yarn.api.ApplicationConstants;
 
+import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
 
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.gobblin.annotation.Alpha;
+import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.DynamicConfigGenerator;
 import org.apache.gobblin.runtime.AbstractJobLauncher;
 import org.apache.gobblin.runtime.DynamicConfigGeneratorFactory;
-
-import static org.apache.gobblin.cluster.GobblinClusterConfigurationKeys.CLUSTER_WORK_DIR;
+import org.apache.gobblin.util.ConfigUtils;
+import org.apache.gobblin.util.JobConfigurationUtils;
+import org.apache.gobblin.util.PathUtils;
 
 @Alpha
 @Slf4j
 public class GobblinClusterUtils {
+  static final String JAVA_TMP_DIR_KEY = "java.io.tmpdir";
+  /**
+   * This template will be resolved by replacing "VALUE" as the value that gobblin recognized.
+   * For more details, check {@link GobblinClusterUtils#setSystemProperties(Config)}
+   */
+  private static final String GOBBLIN_CLUSTER_SYSTEM_PROPERTY_LIST_TEMPLATE
+      = GobblinClusterConfigurationKeys.GOBBLIN_CLUSTER_PREFIX + "systemPropertiesList.$VALUE";
+
+  /**
+   * This enum is used for specifying JVM options that Gobblin-Cluster will set whose value will need to be obtained
+   * in JVM runtime.
+   * e.g. YARN_CACHE will be used by Gobblin-on-YARN (an extension of Gobblin-Cluster) and resolved to an YARN-specific
+   * temporary location internal to the application.
+   *
+   * Note that we could specify a couple of keys associated with the value, meaning the value should only be resolved
+   * to associated keys but nothing else to avoid abusive usage. Users could also set resolved
+   * {@link #GOBBLIN_CLUSTER_SYSTEM_PROPERTY_LIST_TEMPLATE} to expand default associated-key list.
+   *
+   * e.g. setting `gobblin.cluster.systemPropertiesList.YARN_CACHE` = [a,b] expands the associated-key list to
+   * [java.io.tmpdir, a, b]. Only when a key is found in the associated-key list, then when you set
+   * {@link GobblinClusterConfigurationKeys#GOBBLIN_CLUSTER_SYSTEM_PROPERTY_PREFIX}.${keyName}=YARN_CACHE, will the
+   * resolution for the -D${KeyName} = resolvedValue(YARN_CACHE) happen.
+   */
+  public enum JVM_ARG_VALUE_RESOLVER {
+    YARN_CACHE {
+      @Override
+      public List<String> getAssociatedKeys() {
+        return yarnCacheAssociatedKeys;
+      }
+
+      @Override
+      public String getResolution() {
+        //When keys like java.io.tmpdir is configured to "YARN_CACHE", it sets the tmp dir to the Yarn container's cache location.
+        // This setting will only be useful when the cluster is deployed in Yarn mode.
+        return System.getenv(ApplicationConstants.Environment.PWD.key());
+      }
+    };
+
+    // Kept for backward-compatibility
+    private static List<String> yarnCacheAssociatedKeys = ImmutableList.of(JAVA_TMP_DIR_KEY);
+
+    // default associated key with the value.
+    public abstract List<String> getAssociatedKeys() ;
+
+    public abstract String getResolution();
+
+    public static boolean contains(String value) {
+      for (JVM_ARG_VALUE_RESOLVER v : JVM_ARG_VALUE_RESOLVER.values()) {
+        if (v.name().equalsIgnoreCase(value)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
 
   /**
    * Get the name of the current host.
@@ -57,14 +129,11 @@ public class GobblinClusterUtils {
    * @param applicationId the application ID in string form
    * @return the cluster application working directory {@link Path}
    */
-  public static Path getAppWorkDirPath(FileSystem fs, String applicationName, String applicationId) {
-    return new Path(fs.getHomeDirectory(), getAppWorkDirPath(applicationName, applicationId));
-  }
-
   public static Path getAppWorkDirPathFromConfig(Config config, FileSystem fs,
       String applicationName, String applicationId) {
-    if (config.hasPath(CLUSTER_WORK_DIR)) {
-      return new Path(config.getString(CLUSTER_WORK_DIR));
+    if (config.hasPath(GobblinClusterConfigurationKeys.CLUSTER_WORK_DIR)) {
+      return new Path(new Path(fs.getUri()), PathUtils.combinePaths(config.getString(GobblinClusterConfigurationKeys.CLUSTER_WORK_DIR),
+          getAppWorkDirPath(applicationName, applicationId)));
     }
     return new Path(fs.getHomeDirectory(), getAppWorkDirPath(applicationName, applicationId));
   }
@@ -107,6 +176,44 @@ public class GobblinClusterUtils {
   }
 
   /**
+   * Set the system properties from the input {@link Config} instance
+   * @param config
+   */
+  public static void setSystemProperties(Config config) {
+    Properties properties = ConfigUtils.configToProperties(ConfigUtils.getConfig(config,
+        GobblinClusterConfigurationKeys.GOBBLIN_CLUSTER_SYSTEM_PROPERTY_PREFIX, ConfigFactory.empty()));
+
+    for (Map.Entry<Object, Object> entry: properties.entrySet()) {
+      if (JVM_ARG_VALUE_RESOLVER.contains(entry.getValue().toString())) {
+        JVM_ARG_VALUE_RESOLVER enumMember = JVM_ARG_VALUE_RESOLVER.valueOf(entry.getValue().toString());
+        List<String> allowedKeys = new ArrayList<>(enumMember.getAssociatedKeys());
+        allowedKeys.addAll(getAdditionalKeys(entry.getValue().toString(), config));
+
+        if (allowedKeys.contains(entry.getKey().toString())) {
+          log.info("Setting tmp directory to: {}", enumMember.getResolution());
+          System.setProperty(entry.getKey().toString(), enumMember.getResolution());
+          continue;
+        } else {
+          log.warn("String {} not being registered for dynamic JVM-arg resolution, "
+              + "considering add it by setting extension key", entry.getKey());
+        }
+      }
+      System.setProperty(entry.getKey().toString(), entry.getValue().toString());
+    }
+  }
+
+  private static Collection<String> getAdditionalKeys(String value, Config config) {
+    String resolvedKey = GOBBLIN_CLUSTER_SYSTEM_PROPERTY_LIST_TEMPLATE.replace("$VALUE", value);
+    if (config.hasPath(resolvedKey)) {
+      return StreamSupport.stream(
+          Splitter.on(",").trimResults().omitEmptyStrings().split(config.getString(resolvedKey)).spliterator(), false
+      ).collect(Collectors.toList());
+    } else {
+      return Lists.newArrayList();
+    }
+  }
+
+  /**
    * Get the dynamic config from a {@link DynamicConfigGenerator}
    * @param config input config
    * @return  the dynamic config
@@ -129,4 +236,22 @@ public class GobblinClusterUtils {
     return getDynamicConfig(config).withFallback(config);
   }
 
+  /**
+   * A utility method to construct a {@link FileSystem} object with the configured Hadoop overrides provided as part of
+   * the cluster configuration.
+   * @param config
+   * @param conf
+   * @return a {@link FileSystem} object that is instantiated with the appropriated Hadoop config overrides.
+   * @throws IOException
+   */
+  public static FileSystem buildFileSystem(Config config, Configuration conf)
+      throws IOException {
+    Config hadoopOverrides = ConfigUtils.getConfigOrEmpty(config, GobblinClusterConfigurationKeys.HADOOP_CONFIG_OVERRIDES_PREFIX);
+
+    //Add any Hadoop-specific overrides into the Configuration object
+    JobConfigurationUtils.putPropertiesIntoConfiguration(ConfigUtils.configToProperties(hadoopOverrides), conf);
+    return config.hasPath(ConfigurationKeys.FS_URI_KEY) ? FileSystem
+        .get(URI.create(config.getString(ConfigurationKeys.FS_URI_KEY)), conf)
+        : FileSystem.get(conf);
+  }
 }

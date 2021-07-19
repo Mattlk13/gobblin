@@ -23,11 +23,11 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.gobblin.commit.SpeculativeAttemptAwareConstruct;
+import org.apache.gobblin.stream.FlushControlMessage;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
 import com.google.common.base.Strings;
-import com.google.common.io.Closer;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.State;
@@ -44,8 +44,10 @@ import org.apache.gobblin.util.HadoopUtils;
 import io.reactivex.Flowable;
 import javax.annotation.concurrent.ThreadSafe;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 
+@Slf4j
 public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, RecordStreamProcessor<S, S, D, D>,
                                                     SpeculativeAttemptAwareConstruct {
 
@@ -58,11 +60,11 @@ public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, Recor
     return this.list.stream().noneMatch(x -> x.getType().equals(RowLevelPolicy.Type.ERR_FILE)) || this.allowSpeculativeExecWhenWriteErrFile;
   }
 
+  @Getter
   private final List<RowLevelPolicy> list;
   private final String stateId;
   private final FileSystem fs;
   private boolean errFileOpen;
-  private final Closer closer;
   private final FrontLoadedSampler sampler;
   private RowLevelErrFileWriter writer;
   @Getter
@@ -88,8 +90,6 @@ public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, Recor
     this.stateId = stateId;
     this.fs = fs;
     this.errFileOpen = false;
-    this.closer = Closer.create();
-    this.writer = this.closer.register(new RowLevelErrFileWriter(this.fs));
     this.results = new RowLevelPolicyCheckResults();
     this.sampler = new FrontLoadedSampler(state.getPropAsLong(ConfigurationKeys.ROW_LEVEL_ERR_FILE_RECORDS_PER_TASK,
         ConfigurationKeys.DEFAULT_ROW_LEVEL_ERR_FILE_RECORDS_PER_TASK), 1.5);
@@ -102,25 +102,36 @@ public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, Recor
     for (RowLevelPolicy p : this.list) {
       RowLevelPolicy.Result result = p.executePolicy(record);
       results.put(p, result);
-
-      if (result.equals(RowLevelPolicy.Result.FAILED)) {
-        if (p.getType().equals(RowLevelPolicy.Type.FAIL)) {
-          throw new RuntimeException("RowLevelPolicy " + p + " failed on record " + record);
-        } else if (p.getType().equals(RowLevelPolicy.Type.ERR_FILE)) {
-          if (this.sampler.acceptNext()) {
-            if (!this.errFileOpen) {
-              this.writer.open(getErrFilePath(p));
-              this.writer.write(record);
-            } else {
-              this.writer.write(record);
-            }
-            this.errFileOpen = true;
-          }
-        }
+      if (!checkResult(result, p, record)) {
         return false;
       }
     }
     return true;
+  }
+
+  /**
+   * Handle the result of {@link RowLevelPolicy#executePolicy(Object)}
+   */
+  protected boolean checkResult(RowLevelPolicy.Result checkResult, RowLevelPolicy p, Object record) throws IOException {
+    boolean result = true;
+    if (checkResult.equals(RowLevelPolicy.Result.FAILED)) {
+      if (p.getType().equals(RowLevelPolicy.Type.FAIL)) {
+        throw new RuntimeException("RowLevelPolicy " + p + " failed on record " + record);
+      } else if (p.getType().equals(RowLevelPolicy.Type.ERR_FILE)) {
+        if (this.sampler.acceptNext()) {
+          if (!this.errFileOpen) {
+            this.writer = new RowLevelErrFileWriter(this.fs);
+            this.writer.open(getErrFilePath(p));
+            this.writer.write(record);
+          } else {
+            this.writer.write(record);
+          }
+          this.errFileOpen = true;
+        }
+      }
+      result = false;
+    }
+    return result;
   }
 
   Path getErrFilePath(RowLevelPolicy policy) {
@@ -139,7 +150,8 @@ public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, Recor
   @Override
   public void close() throws IOException {
     if (this.errFileOpen) {
-      this.closer.close();
+      this.writer.close();
+      this.errFileOpen = false;
     }
   }
 
@@ -186,7 +198,22 @@ public class RowLevelPolicyChecker<S, D> implements Closeable, FinalState, Recor
    * @return a {@link ControlMessageHandler}.
    */
   protected ControlMessageHandler getMessageHandler() {
-    return ControlMessageHandler.NOOP;
+    /**
+     * When seeing {@link FlushControlMessage and using ERR_FILE as the quality-checker handling,
+     * close the open error file and create new one.
+     */
+    return new ControlMessageHandler() {
+      @Override
+      public void handleMessage(ControlMessage message) {
+        if (message instanceof FlushControlMessage ) {
+          try {
+            RowLevelPolicyChecker.this.close();
+          } catch (IOException ioe) {
+            log.error("Failed to close errFile", ioe);
+          }
+        }
+      }
+    };
   }
 
   /**

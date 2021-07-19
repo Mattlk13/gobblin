@@ -18,8 +18,6 @@
 package org.apache.gobblin.cluster;
 
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -58,6 +56,7 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigValueFactory;
 
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -73,7 +72,6 @@ import org.apache.gobblin.runtime.app.ApplicationLauncher;
 import org.apache.gobblin.runtime.app.ServiceBasedAppLauncher;
 import org.apache.gobblin.scheduler.SchedulerService;
 import org.apache.gobblin.util.ConfigUtils;
-import org.apache.gobblin.util.JobConfigurationUtils;
 import org.apache.gobblin.util.JvmUtils;
 import org.apache.gobblin.util.reflection.GobblinConstructorUtils;
 
@@ -111,6 +109,7 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
   protected ServiceBasedAppLauncher applicationLauncher;
 
   // An EventBus used for communications between services running in the ApplicationMaster
+  @Getter(AccessLevel.PUBLIC)
   protected final EventBus eventBus = new EventBus(GobblinClusterManager.class.getSimpleName());
 
   protected final Path appWorkDir;
@@ -141,25 +140,28 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
   @Getter
   protected final Config config;
 
-  public GobblinClusterManager(String clusterName, String applicationId, Config config,
+  public GobblinClusterManager(String clusterName, String applicationId, Config sysConfig,
       Optional<Path> appWorkDirOptional) throws Exception {
+    // Set system properties passed in via application config. As an example, Helix uses System#getProperty() for ZK configuration
+    // overrides such as sessionTimeout. In this case, the overrides specified
+    // in the application configuration have to be extracted and set before initializing HelixManager.
+    GobblinClusterUtils.setSystemProperties(sysConfig);
+
+    //Add dynamic config
+    this.config = GobblinClusterUtils.addDynamicConfig(sysConfig);
+
     this.clusterName = clusterName;
-    this.config = config;
-    this.isStandaloneMode = ConfigUtils.getBoolean(config, GobblinClusterConfigurationKeys.STANDALONE_CLUSTER_MODE_KEY,
+    this.isStandaloneMode = ConfigUtils.getBoolean(this.config, GobblinClusterConfigurationKeys.STANDALONE_CLUSTER_MODE_KEY,
         GobblinClusterConfigurationKeys.DEFAULT_STANDALONE_CLUSTER_MODE);
 
     this.applicationId = applicationId;
 
-    //Set system properties passed in via application config. As an example, Helix uses System#getProperty() for ZK configuration
-    // overrides such as sessionTimeout. In this case, the overrides specified
-    // in the application configuration have to be extracted and set before initializing HelixManager.
-    HelixUtils.setSystemProperties(config);
-
     initializeHelixManager();
 
-    this.fs = buildFileSystem(config);
+    this.fs = GobblinClusterUtils.buildFileSystem(this.config, new Configuration());
     this.appWorkDir = appWorkDirOptional.isPresent() ? appWorkDirOptional.get()
-        : GobblinClusterUtils.getAppWorkDirPathFromConfig(config, this.fs, clusterName, applicationId);
+        : GobblinClusterUtils.getAppWorkDirPathFromConfig(this.config, this.fs, clusterName, applicationId);
+    LOGGER.info("Configured GobblinClusterManager work dir to: {}", this.appWorkDir);
 
     initializeAppLauncherAndServices();
   }
@@ -234,7 +236,9 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
   }
 
   /**
-   * Configure Helix quota-based task scheduling
+   * Configure Helix quota-based task scheduling.
+   * This config controls the number of tasks that are concurrently assigned to a single Helix instance.
+   * Reference: https://helix.apache.org/0.9.1-docs/quota_scheduling.html
    */
   @VisibleForTesting
   void configureHelixQuotaBasedTaskScheduling() {
@@ -357,27 +361,11 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
   }
 
   /**
-   * Build the {@link FileSystem} for the Application Master.
-   */
-  private FileSystem buildFileSystem(Config config) throws IOException {
-    Config hadoopOverrides = ConfigUtils.getConfigOrEmpty(config, GobblinClusterConfigurationKeys.HADOOP_CONFIG_OVERRIDES_PREFIX);
-
-    Configuration conf = new Configuration();
-    //Add any Hadoop-specific overrides into the Configuration object
-    JobConfigurationUtils.putPropertiesIntoConfiguration(ConfigUtils.configToProperties(hadoopOverrides), conf);
-
-    return config.hasPath(ConfigurationKeys.FS_URI_KEY) ? FileSystem
-        .get(URI.create(config.getString(ConfigurationKeys.FS_URI_KEY)), conf)
-        : FileSystem.get(conf);
-  }
-
-  /**
    * Build the {@link GobblinHelixJobScheduler} for the Application Master.
    */
-  private GobblinHelixJobScheduler buildGobblinHelixJobScheduler(Config config, Path appWorkDir,
+  private GobblinHelixJobScheduler buildGobblinHelixJobScheduler(Config sysConfig, Path appWorkDir,
       List<? extends Tag<?>> metadataTags, SchedulerService schedulerService) throws Exception {
-    Properties properties = ConfigUtils.configToProperties(config);
-    return new GobblinHelixJobScheduler(properties,
+    return new GobblinHelixJobScheduler(sysConfig,
         this.multiManager.getJobClusterHelixManager(),
         this.multiManager.getTaskDriverHelixManager(),
         this.eventBus,
@@ -391,21 +379,16 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
    * Build the {@link JobConfigurationManager} for the Application Master.
    */
   private JobConfigurationManager buildJobConfigurationManager(Config config) {
-    return create(config);
-  }
-
-  private JobConfigurationManager create(Config config) {
     try {
-      List<Object> argumentList = (this.jobCatalog != null)? ImmutableList.of(this.eventBus, config, this.jobCatalog) :
-          ImmutableList.of(this.eventBus, config);
+      List<Object> argumentList = (this.jobCatalog != null)? ImmutableList.of(this.eventBus, config, this.jobCatalog, this.fs) :
+          ImmutableList.of(this.eventBus, config, this.fs);
       if (config.hasPath(GobblinClusterConfigurationKeys.JOB_CONFIGURATION_MANAGER_KEY)) {
-        return (JobConfigurationManager) GobblinConstructorUtils.invokeFirstConstructor(Class.forName(
-            config.getString(GobblinClusterConfigurationKeys.JOB_CONFIGURATION_MANAGER_KEY)), argumentList);
+        return (JobConfigurationManager) GobblinConstructorUtils.invokeLongestConstructor(Class.forName(
+            config.getString(GobblinClusterConfigurationKeys.JOB_CONFIGURATION_MANAGER_KEY)), argumentList.toArray(new Object[argumentList.size()]));
       } else {
         return new JobConfigurationManager(this.eventBus, config);
       }
-    } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | InstantiationException |
-        ClassNotFoundException e) {
+    } catch (ReflectiveOperationException e) {
       throw new RuntimeException(e);
     }
   }
@@ -415,12 +398,6 @@ public class GobblinClusterManager implements ApplicationLauncher, StandardMetri
   public void handleApplicationMasterShutdownRequest(ClusterManagerShutdownRequest shutdownRequest) {
     stop();
   }
-
-  @VisibleForTesting
-  EventBus getEventBus() {
-    return this.eventBus;
-  }
-
 
   /**
    * Creates and returns a {@link MessageHandlerFactory} for handling of Helix

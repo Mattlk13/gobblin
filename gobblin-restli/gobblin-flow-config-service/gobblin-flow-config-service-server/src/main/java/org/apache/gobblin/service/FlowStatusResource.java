@@ -20,10 +20,6 @@ package org.apache.gobblin.service;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.google.inject.Inject;
 import com.linkedin.restli.common.ComplexResourceKey;
 import com.linkedin.restli.common.EmptyRecord;
 import com.linkedin.restli.server.PagingContext;
@@ -34,6 +30,8 @@ import com.linkedin.restli.server.annotations.QueryParam;
 import com.linkedin.restli.server.annotations.RestLiCollection;
 import com.linkedin.restli.server.resources.ComplexKeyResourceTemplate;
 
+import javax.inject.Inject;
+
 import org.apache.gobblin.service.monitoring.FlowStatusGenerator;
 
 
@@ -42,10 +40,9 @@ import org.apache.gobblin.service.monitoring.FlowStatusGenerator;
  */
 @RestLiCollection(name = "flowstatuses", namespace = "org.apache.gobblin.service", keyName = "id")
 public class FlowStatusResource extends ComplexKeyResourceTemplate<FlowStatusId, EmptyRecord, FlowStatus> {
-  public static final String FLOW_STATUS_GENERATOR_INJECT_NAME = "FlowStatusGenerator";
   public static final String MESSAGE_SEPARATOR = ", ";
 
-  @Inject @javax.inject.Inject @javax.inject.Named(FLOW_STATUS_GENERATOR_INJECT_NAME)
+  @Inject
   FlowStatusGenerator _flowStatusGenerator;
 
   public FlowStatusResource() {}
@@ -58,13 +55,14 @@ public class FlowStatusResource extends ComplexKeyResourceTemplate<FlowStatusId,
   @Override
   public FlowStatus get(ComplexResourceKey<FlowStatusId, EmptyRecord> key) {
     // this returns null to raise a 404 error if flowStatus is null
-    return convertFlowStatus(FlowExecutionResource.getFlowStatusFromGenerator(key, this._flowStatusGenerator));
+    return convertFlowStatus(FlowExecutionResourceLocalHandler.getFlowStatusFromGenerator(key, this._flowStatusGenerator));
   }
 
   @Finder("latestFlowStatus")
   public List<FlowStatus> getLatestFlowStatus(@Context PagingContext context,
       @QueryParam("flowId") FlowId flowId, @Optional @QueryParam("count") Integer count, @Optional @QueryParam("tag") String tag) {
-    List<org.apache.gobblin.service.monitoring.FlowStatus> flowStatuses = FlowExecutionResource.getLatestFlowStatusesFromGenerator(flowId, count, tag, this._flowStatusGenerator);
+    List<org.apache.gobblin.service.monitoring.FlowStatus> flowStatuses = FlowExecutionResourceLocalHandler
+        .getLatestFlowStatusesFromGenerator(flowId, count, tag, null, this._flowStatusGenerator);
 
     if (flowStatuses != null) {
       return flowStatuses.stream().map(this::convertFlowStatus).collect(Collectors.toList());
@@ -81,7 +79,10 @@ public class FlowStatusResource extends ComplexKeyResourceTemplate<FlowStatusId,
    * @return a {@link org.apache.gobblin.service.FlowStatus} converted from a {@link org.apache.gobblin.service.monitoring.FlowStatus}
    */
   private FlowStatus convertFlowStatus(org.apache.gobblin.service.monitoring.FlowStatus monitoringFlowStatus) {
-    FlowExecution flowExecution = FlowExecutionResource.convertFlowStatus(monitoringFlowStatus);
+    if (monitoringFlowStatus == null) {
+      return null;
+    }
+    FlowExecution flowExecution = FlowExecutionResourceLocalHandler.convertFlowStatus(monitoringFlowStatus);
     return new FlowStatus()
         .setId(flowExecution.getId())
         .setExecutionStatistics(flowExecution.getExecutionStatistics())

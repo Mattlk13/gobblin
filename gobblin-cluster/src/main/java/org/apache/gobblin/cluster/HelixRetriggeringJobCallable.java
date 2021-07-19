@@ -29,6 +29,8 @@ import org.apache.hadoop.fs.Path;
 import org.apache.helix.HelixException;
 import org.apache.helix.HelixManager;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import com.google.common.io.Closer;
 import com.google.common.util.concurrent.Striped;
 import com.typesafe.config.Config;
@@ -153,6 +155,12 @@ class HelixRetriggeringJobCallable implements Callable {
         "false");
 
     try {
+        this.jobsMapping.setDistributedJobMode(this.jobUri, this.isDistributeJobEnabled);
+    } catch (IOException e) {
+        throw new JobException("Could not update jobsMapping", e);
+    }
+
+    try {
       if (this.isDistributeJobEnabled) {
         runJobExecutionLauncher();
       } else {
@@ -189,16 +197,29 @@ class HelixRetriggeringJobCallable implements Callable {
     }
   }
 
+  @VisibleForTesting
+  static GobblinHelixJobLauncher buildJobLauncherForCentralizedMode(GobblinHelixJobScheduler jobScheduler, Properties jobProps) throws Exception {
+    //In centralized job launcher mode, the JOB_ID_KEY should be null or should not contain the
+    //"ActualJob" substring, which is intended for the distributed job launcher mode.
+    //This ensures that workflows in centralized mode are cleaned up properly when cluster is restarted.
+    String jobId = jobProps.getProperty(ConfigurationKeys.JOB_ID_KEY);
+    if (jobId != null) {
+      Preconditions.checkArgument(!jobId.contains(GobblinClusterConfigurationKeys.ACTUAL_JOB_NAME_PREFIX),
+          "Job Id should not contain ActualJob in centralized mode.");
+    }
+    return jobScheduler.buildJobLauncher(jobProps);
+  }
+
   /**
-   * <p> In some cases, the job launcher will be early stopped.
-   * It can be due to the large volume of input source data.
-   * In such case, we need to re-launch the same job until
-   * the job launcher determines it is safe to stop.
+   * A method to run a Gobblin job with ability to re-trigger the job if neeeded. This method instantiates a
+   * {@link GobblinHelixJobLauncher} and submits the underlying Gobblin job to a {link GobblinHelixJobScheduler}.
+   * The method will re-submit the job if it has been terminated "early" e.g. before all data has been pulled.
+   * This method should be called only when distributed job launcher mode is disabled.
    */
-  private void runJobLauncherLoop() throws JobException {
+   private void runJobLauncherLoop() throws JobException {
     try {
       while (true) {
-        currentJobLauncher = this.jobScheduler.buildJobLauncher(jobProps);
+        currentJobLauncher = buildJobLauncherForCentralizedMode(jobScheduler, jobProps);
         // in "run once" case, job scheduler will remove current job from the scheduler
         boolean isEarlyStopped = this.jobScheduler.runJob(jobProps, jobListener, currentJobLauncher);
         boolean isRetriggerEnabled = this.isRetriggeringEnabled();
@@ -207,11 +228,12 @@ class HelixRetriggeringJobCallable implements Callable {
         } else {
           break;
         }
-        currentJobLauncher = null;
       }
     } catch (Exception e) {
       log.error("Failed to run job {}", jobProps.getProperty(ConfigurationKeys.JOB_NAME_KEY), e);
       throw new JobException("Failed to run job " + jobProps.getProperty(ConfigurationKeys.JOB_NAME_KEY), e);
+    } finally {
+      currentJobLauncher = null;
     }
   }
 
@@ -225,7 +247,6 @@ class HelixRetriggeringJobCallable implements Callable {
   private void runJobExecutionLauncher() throws JobException {
     long startTime = 0;
     String newPlanningId;
-    String jobName = jobProps.getProperty(ConfigurationKeys.JOB_NAME_KEY);
     Closer closer = Closer.create();
     try {
       HelixManager planningJobManager = this.taskDriverHelixManager.isPresent()?
@@ -235,41 +256,18 @@ class HelixRetriggeringJobCallable implements Callable {
           GobblinHelixDistributeJobExecutionLauncher.Builder.class.getName());
 
       // Check if any existing planning job is running
-      Optional<String> planningJobIdFromStore = jobsMapping.getPlanningJobId(jobName);
+      Optional<String> planningJobIdFromStore = jobsMapping.getPlanningJobId(this.jobUri);
       boolean nonblocking = false;
       // start of critical section to check if a job with same job name is running
-      Lock jobLock = locks.get(jobName);
+      Lock jobLock = locks.get(this.jobUri);
       jobLock.lock();
 
       try {
-        if (planningJobIdFromStore.isPresent()) {
-          String previousPlanningJobId = planningJobIdFromStore.get();
-
-          if (HelixUtils.isJobFinished(previousPlanningJobId, previousPlanningJobId, planningJobManager)) {
-            log.info("Previous planning job {} has reached to the final state. Start a new one.", previousPlanningJobId);
-          } else {
-            boolean killDuplicateJob = PropertiesUtils
-                .getPropAsBoolean(this.jobProps, GobblinClusterConfigurationKeys.KILL_DUPLICATE_PLANNING_JOB, String.valueOf(GobblinClusterConfigurationKeys.DEFAULT_KILL_DUPLICATE_PLANNING_JOB));
-
-            if (!killDuplicateJob) {
-              log.info("Previous planning job {} has not finished yet. Skip this job.", previousPlanningJobId);
-              return;
-            } else {
-              log.info("Previous planning job {} has not finished yet. Kill it.", previousPlanningJobId);
-              long timeOut = PropertiesUtils.getPropAsLong(sysProps, GobblinClusterConfigurationKeys.HELIX_WORKFLOW_DELETE_TIMEOUT_SECONDS,
-                  GobblinClusterConfigurationKeys.DEFAULT_HELIX_WORKFLOW_DELETE_TIMEOUT_SECONDS) * 1000;
-              try {
-                HelixUtils.deleteWorkflow(previousPlanningJobId, planningJobManager, timeOut);
-              } catch (HelixException e) {
-                log.info("Helix cannot delete previous planning job id {} within {} seconds.", previousPlanningJobId,
-                    timeOut / 1000);
-                throw new JobException("Helix cannot delete previous planning job id " + previousPlanningJobId, e);
-              }
-            }
-          }
-        } else {
-          log.info("Planning job for {} does not exist. First time run.", jobName);
+        if (planningJobIdFromStore.isPresent() && !canRun(planningJobIdFromStore.get(), planningJobManager)) {
+          return;
         }
+
+        log.info("Planning job for {} does not exist. First time run.", this.jobUri);
 
         GobblinHelixDistributeJobExecutionLauncher.Builder builder = GobblinConstructorUtils.<GobblinHelixDistributeJobExecutionLauncher.Builder>invokeLongestConstructor(
             new ClassAliasResolver(GobblinHelixDistributeJobExecutionLauncher.Builder.class).resolveClass(builderStr));
@@ -297,21 +295,21 @@ class HelixRetriggeringJobCallable implements Callable {
         Config combined = ConfigUtils.propertiesToConfig(jobPlanningProps)
             .withFallback(ConfigUtils.propertiesToConfig(sysProps));
 
-        nonblocking = ConfigUtils.getBoolean(combined, GobblinClusterConfigurationKeys.NON_BLOCKING_PLANNING_JOB_ENABLED,
-            GobblinClusterConfigurationKeys.DEFAULT_NON_BLOCKING_PLANNING_JOB_ENABLED);
+        nonblocking = ConfigUtils
+            .getBoolean(combined, GobblinClusterConfigurationKeys.NON_BLOCKING_PLANNING_JOB_ENABLED,
+                GobblinClusterConfigurationKeys.DEFAULT_NON_BLOCKING_PLANNING_JOB_ENABLED);
 
         log.info("Planning job {} started.", newPlanningId);
         GobblinHelixDistributeJobExecutionLauncher launcher = builder.build();
         closer.register(launcher);
-        this.jobsMapping.setPlanningJobId(jobName, newPlanningId);
+        this.jobsMapping.setPlanningJobId(this.jobUri, newPlanningId);
         startTime = System.currentTimeMillis();
         this.currentJobMonitor = launcher.launchJob(null);
 
         // make sure the planning job is initialized (or visible) to other parallel running threads,
         // so that the same critical section check (querying Helix for job completeness)
         // can be applied.
-        HelixUtils.waitJobInitialization(planningJobManager, newPlanningId, newPlanningId, 300_000);
-
+        HelixUtils.waitJobInitialization(planningJobManager, newPlanningId, newPlanningId);
       } finally {
         // end of the critical section to check if a job with same job name is running
         jobLock.unlock();
@@ -320,7 +318,7 @@ class HelixRetriggeringJobCallable implements Callable {
       // we can remove the job spec from the catalog because Helix will drive this job to the end.
       this.deleteJobSpec();
 
-      // If we are using non-blocking mode, this get() only guarantees the plannning job is submitted.
+      // If we are using non-blocking mode, this get() only guarantees the planning job is submitted.
       // It doesn't guarantee the job will finish because internally we won't wait for Helix completion.
       this.currentJobMonitor.get();
       this.currentJobMonitor = null;
@@ -334,15 +332,53 @@ class HelixRetriggeringJobCallable implements Callable {
       if (startTime != 0) {
         this.planningJobLauncherMetrics.updateTimeForFailedPlanningJobs(startTime);
       }
-      log.error("Failed to run planning job {}", jobName, e);
-      throw new JobException("Failed to run planning job " + jobName, e);
+      log.error("Failed to run planning job for {}", this.jobUri, e);
+      throw new JobException("Failed to run planning job for " + this.jobUri, e);
     } finally {
       try {
         closer.close();
       } catch (IOException e) {
-        throw new JobException("Cannot properly close planning job " + jobName, e);
+        throw new JobException("Cannot properly close planning job for " + this.jobUri, e);
       }
     }
+  }
+
+    /**
+     * This method checks if a job can be submitted to helix for execution.
+     * A job can run, 1) if the previous job with the same job id is finished,
+     * 2) if the previous job is running but can be killed specified by property
+     * {@link GobblinClusterConfigurationKeys#KILL_DUPLICATE_PLANNING_JOB}, default being true
+     * @param previousJobId job id from the previous execution
+     * @param helixManager helix manager
+     * @return true if the job can run on Helix
+     * @throws JobException if previous job deletion fails
+     * @throws InterruptedException
+     */
+  private boolean canRun(String previousJobId, HelixManager helixManager) throws JobException, InterruptedException {
+    if (HelixUtils.isJobFinished(previousJobId, previousJobId, helixManager)) {
+      log.info("Previous planning job {} has reached to the final state. Start a new one.", previousJobId);
+    } else {
+      boolean killDuplicateJob = PropertiesUtils
+          .getPropAsBoolean(this.jobProps, GobblinClusterConfigurationKeys.KILL_DUPLICATE_PLANNING_JOB, String.valueOf(GobblinClusterConfigurationKeys.DEFAULT_KILL_DUPLICATE_PLANNING_JOB));
+
+      if (!killDuplicateJob) {
+        log.info("Previous planning job {} has not finished yet. Skip this job.", previousJobId);
+        return false;
+      } else {
+        log.info("Previous planning job {} has not finished yet. Kill it.", previousJobId);
+        long timeOut = PropertiesUtils
+            .getPropAsLong(sysProps, GobblinClusterConfigurationKeys.HELIX_WORKFLOW_DELETE_TIMEOUT_SECONDS,
+                GobblinClusterConfigurationKeys.DEFAULT_HELIX_WORKFLOW_DELETE_TIMEOUT_SECONDS) * 1000;
+        try {
+          HelixUtils.deleteWorkflow(previousJobId, helixManager, timeOut);
+        } catch (HelixException e) {
+          log.info("Helix cannot delete previous planning job id {} within {} seconds.", previousJobId,
+              timeOut / 1000);
+          throw new JobException("Helix cannot delete previous planning job id " + previousJobId, e);
+        }
+      }
+    }
+    return true;
   }
 
   void cancel() throws JobException {

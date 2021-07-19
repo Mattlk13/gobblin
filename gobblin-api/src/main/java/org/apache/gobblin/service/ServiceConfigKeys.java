@@ -23,6 +23,7 @@ import org.apache.gobblin.annotation.Alpha;
 public class ServiceConfigKeys {
 
   public static final String GOBBLIN_SERVICE_PREFIX = "gobblin.service.";
+  public static final String GOBBLIN_SERVICE_JOB_SCHEDULER_LISTENER_CLASS = "org.apache.gobblin.service.modules.scheduler.GobblinServiceJobScheduler";
 
   // Gobblin Service Manager Keys
   public static final String GOBBLIN_SERVICE_TOPOLOGY_CATALOG_ENABLED_KEY = GOBBLIN_SERVICE_PREFIX + "topologyCatalog.enabled";
@@ -49,6 +50,7 @@ public class ServiceConfigKeys {
 
   // Flow Compiler Keys
   public static final String GOBBLIN_SERVICE_FLOWCOMPILER_CLASS_KEY = GOBBLIN_SERVICE_PREFIX + "flowCompiler.class";
+  public static final String COMPILATION_SUCCESSFUL = "compilation.successful";
 
   // Flow Catalog Keys
   public static final String GOBBLIN_SERVICE_FLOW_CATALOG_LOCAL_COMMIT = GOBBLIN_SERVICE_PREFIX + "flowCatalog.localCommit";
@@ -81,6 +83,7 @@ public class ServiceConfigKeys {
   public static final String SPEC_EXECUTOR_KEY = "specExecutorInstance.class";
   public static final String EDGE_SECURITY_KEY = "edge.secured";
 
+  public static final String DATA_MOVEMENT_AUTHORIZER_CLASS = "dataMovementAuthorizer.class";
 
   // Template Catalog Keys
   public static final String TEMPLATE_CATALOGS_FULLY_QUALIFIED_PATH_KEY = GOBBLIN_SERVICE_PREFIX + "templateCatalogs.fullyQualifiedPath";
@@ -112,7 +115,30 @@ public class ServiceConfigKeys {
   public static final String GOBBLIN_SERVICE_LOG4J_CONFIGURATION_FILE = "log4j-service.properties";
   // GAAS Listerning Port
   public static final String SERVICE_PORT = GOBBLIN_SERVICE_PREFIX + "port";
+  public static final String SERVICE_NAME = GOBBLIN_SERVICE_PREFIX + "serviceName";
+  public static final String SERVICE_URL_PREFIX = GOBBLIN_SERVICE_PREFIX + "serviceUrlPrefix";
 
   // Prefix for config to ServiceBasedAppLauncher that will only be used by GaaS and not orchestrated jobs
   public static final String GOBBLIN_SERVICE_APP_LAUNCHER_PREFIX = "gobblinServiceAppLauncher";
+
+  //Flow concurrency config key to control default service behavior.
+  public static final String FLOW_CONCURRENCY_ALLOWED = GOBBLIN_SERVICE_PREFIX + "flowConcurrencyAllowed";
+  public static final Boolean DEFAULT_FLOW_CONCURRENCY_ALLOWED = true;
+
+  public static final String LEADER_URL = "leaderUrl";
+
+  public static final String FORCE_LEADER = GOBBLIN_SERVICE_PREFIX + "forceLeader";
+  public static final boolean DEFAULT_FORCE_LEADER = false;
+  // Group Membership authentication service
+  public static final String GROUP_OWNERSHIP_SERVICE_CLASS = GOBBLIN_SERVICE_PREFIX + "groupOwnershipService.class";
+  public static final String DEFAULT_GROUP_OWNERSHIP_SERVICE = "org.apache.gobblin.service.NoopGroupOwnershipService";
+
+  public static final int MAX_FLOW_NAME_LENGTH = 128; // defined in FlowId.pdl
+  public static final int MAX_FLOW_GROUP_LENGTH = 128; // defined in FlowId.pdl
+  public static final int MAX_JOB_NAME_LENGTH = 374;
+  public static final int MAX_JOB_GROUP_LENGTH = 374;
+  public static final String STATE_STORE_TABLE_SUFFIX = "gst";
+  public static final String STATE_STORE_KEY_SEPARATION_CHARACTER = ".";
+  public static final String DAG_STORE_KEY_SEPARATION_CHARACTER = "_";
+
 }

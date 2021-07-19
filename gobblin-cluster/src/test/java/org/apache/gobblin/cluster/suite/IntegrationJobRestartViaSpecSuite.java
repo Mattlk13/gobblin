@@ -24,7 +24,9 @@ import java.io.Reader;
 import java.net.URI;
 import java.net.URISyntaxException;
 
-import com.google.common.collect.ImmutableMap;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+
 import com.google.common.io.Files;
 import com.google.common.io.Resources;
 import com.typesafe.config.Config;
@@ -33,10 +35,10 @@ import com.typesafe.config.ConfigParseOptions;
 import com.typesafe.config.ConfigSyntax;
 import com.typesafe.config.ConfigValueFactory;
 
+import org.apache.gobblin.cluster.ClusterIntegrationTestUtils;
 import org.apache.gobblin.cluster.FsJobConfigurationManager;
 import org.apache.gobblin.cluster.GobblinClusterConfigurationKeys;
 import org.apache.gobblin.cluster.SleepingTask;
-import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.runtime.api.FsSpecConsumer;
 import org.apache.gobblin.runtime.api.FsSpecProducer;
 import org.apache.gobblin.runtime.api.JobSpec;
@@ -50,9 +52,10 @@ public class IntegrationJobRestartViaSpecSuite extends IntegrationJobCancelSuite
 
   private final SpecProducer _specProducer;
 
-  public IntegrationJobRestartViaSpecSuite() throws IOException {
-    super();
-    this._specProducer = new FsSpecProducer(ConfigFactory.empty().withValue(FsSpecConsumer.SPEC_PATH_KEY, ConfigValueFactory.fromAnyRef(FS_SPEC_CONSUMER_DIR)));
+  public IntegrationJobRestartViaSpecSuite(Config jobConfigOverrides) throws IOException {
+    super(jobConfigOverrides);
+    FileSystem fs = FileSystem.getLocal(new Configuration());
+    this._specProducer = new FsSpecProducer(fs, ConfigFactory.empty().withValue(FsSpecConsumer.SPEC_PATH_KEY, ConfigValueFactory.fromAnyRef(FS_SPEC_CONSUMER_DIR)));
   }
 
   private Config getJobConfig() throws IOException {
@@ -62,12 +65,7 @@ public class IntegrationJobRestartViaSpecSuite extends IntegrationJobCancelSuite
           ConfigFactory.parseReader(reader, ConfigParseOptions.defaults().setSyntax(ConfigSyntax.CONF));
       rawJobConfig = rawJobConfig.withFallback(getClusterConfig());
 
-      Config newConfig = ConfigFactory.parseMap(ImmutableMap
-          .of(ConfigurationKeys.SOURCE_CLASS_KEY, "org.apache.gobblin.cluster.SleepingCustomTaskSource",
-              ConfigurationKeys.JOB_ID_KEY, JOB_ID,
-              GobblinClusterConfigurationKeys.HELIX_JOB_TIMEOUT_ENABLED_KEY, Boolean.TRUE,
-              GobblinClusterConfigurationKeys.HELIX_JOB_TIMEOUT_SECONDS, 100L,
-              ConfigurationKeys.JOB_NAME_KEY, JOB_NAME));
+      Config newConfig = ClusterIntegrationTestUtils.buildSleepingJob(JOB_ID, TASK_STATE_FILE, 100L);
 
       newConfig = newConfig.withValue(SleepingTask.TASK_STATE_FILE_KEY, ConfigValueFactory.fromAnyRef(TASK_STATE_FILE));
       newConfig = newConfig.withFallback(rawJobConfig);
@@ -80,7 +78,6 @@ public class IntegrationJobRestartViaSpecSuite extends IntegrationJobCancelSuite
     Config managerConfig = super.getManagerConfig();
     managerConfig = managerConfig.withValue(GobblinClusterConfigurationKeys.JOB_CONFIGURATION_MANAGER_KEY,
         ConfigValueFactory.fromAnyRef(FsJobConfigurationManager.class.getName()))
-    .withValue(GobblinClusterConfigurationKeys.SPEC_CONSUMER_CLASS_KEY, ConfigValueFactory.fromAnyRef(FsSpecConsumer.class.getName()))
         .withValue(GobblinClusterConfigurationKeys.JOB_SPEC_REFRESH_INTERVAL, ConfigValueFactory.fromAnyRef(1L))
     .withValue(FsSpecConsumer.SPEC_PATH_KEY, ConfigValueFactory.fromAnyRef(FS_SPEC_CONSUMER_DIR));
     return managerConfig;

@@ -76,6 +76,8 @@ public class IntegrationBasicSuite {
   public static final String WORKER_INSTANCE_0 = "WorkerInstance_0";
   public static final String TEST_INSTANCE_NAME_KEY = "worker.instance.name";
 
+  protected final Config jobConfigOverrides;
+
   // manager and workers
   protected Config managerConfig;
   protected Collection<Config> taskDriverConfigs = Lists.newArrayList();
@@ -93,6 +95,11 @@ public class IntegrationBasicSuite {
   protected TestingServer testingZKServer;
 
   public IntegrationBasicSuite() {
+    this(ConfigFactory.empty());
+  }
+
+  public IntegrationBasicSuite(Config jobConfigOverrides) {
+    this.jobConfigOverrides = jobConfigOverrides;
     try {
       initWorkDir();
       initJobOutputDir();
@@ -130,8 +137,8 @@ public class IntegrationBasicSuite {
   }
 
   private void initWorkDir() throws IOException {
-    // Relative to the current directory
-    this.workPath = Paths.get("gobblin-integration-test-work-dir");
+    this.workPath = Paths.get(ConfigFactory.parseURL(Resources.getResource("BasicCluster.conf"))
+        .getString(GobblinClusterConfigurationKeys.CLUSTER_WORK_DIR));
     log.info("Created a new work directory: " + this.workPath.toAbsolutePath());
 
     // Delete the working directory in case the previous test fails to delete the directory
@@ -163,7 +170,7 @@ public class IntegrationBasicSuite {
   }
 
   protected Map<String, Config> overrideJobConfigs(Config rawJobConfig) {
-    return ImmutableMap.of(JOB_NAME, rawJobConfig);
+    return ImmutableMap.of(JOB_NAME, this.jobConfigOverrides.withFallback(rawJobConfig));
   }
 
   private void writeJobConf(String jobName, Config jobConfig) throws IOException {
@@ -182,7 +189,7 @@ public class IntegrationBasicSuite {
     Map<String, String> configMap = new HashMap<>();
     String zkConnectionString = this.testingZKServer.getConnectString();
     configMap.put(GobblinClusterConfigurationKeys.ZK_CONNECTION_STRING_KEY, zkConnectionString);
-    configMap.put(GobblinClusterConfigurationKeys.CLUSTER_WORK_DIR, this.workPath.toString());
+    configMap.put(GobblinTaskRunner.CLUSTER_APP_WORK_DIR, this.workPath.toString());
     Config overrideConfig = ConfigFactory.parseMap(configMap);
 
     return overrideConfig.withFallback(config);

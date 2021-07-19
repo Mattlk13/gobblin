@@ -18,6 +18,7 @@
 package org.apache.gobblin.runtime;
 
 import java.io.IOException;
+import java.net.Authenticator;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -40,6 +41,7 @@ import com.google.common.base.Function;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -60,20 +62,20 @@ import org.apache.gobblin.commit.DeliverySemantics;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.WorkUnitState;
 import org.apache.gobblin.converter.initializer.ConverterInitializerFactory;
+import org.apache.gobblin.destination.DestinationDatasetHandlerService;
 import org.apache.gobblin.metrics.ContextAwareGauge;
 import org.apache.gobblin.metrics.GobblinMetrics;
 import org.apache.gobblin.metrics.GobblinMetricsRegistry;
 import org.apache.gobblin.metrics.MetricContext;
-import org.apache.gobblin.metrics.RootMetricContext;
+import org.apache.gobblin.metrics.ServiceMetricNames;
 import org.apache.gobblin.metrics.Tag;
 import org.apache.gobblin.metrics.event.EventName;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.metrics.event.JobEvent;
 import org.apache.gobblin.metrics.event.TimingEvent;
-import org.apache.gobblin.metrics.reporter.util.MetricReportUtils;
-import org.apache.gobblin.runtime.api.EventMetadataGenerator;
 import org.apache.gobblin.runtime.api.JobSpec;
 import org.apache.gobblin.runtime.api.JobTemplate;
+import org.apache.gobblin.runtime.api.MultiEventMetadataGenerator;
 import org.apache.gobblin.runtime.api.SpecNotFoundException;
 import org.apache.gobblin.runtime.job_spec.JobSpecResolver;
 import org.apache.gobblin.runtime.listeners.CloseableJobListener;
@@ -84,6 +86,9 @@ import org.apache.gobblin.runtime.locks.JobLock;
 import org.apache.gobblin.runtime.locks.JobLockEventListener;
 import org.apache.gobblin.runtime.locks.JobLockException;
 import org.apache.gobblin.runtime.locks.LegacyJobLockFactoryManager;
+import org.apache.gobblin.runtime.troubleshooter.AutomaticTroubleshooter;
+import org.apache.gobblin.runtime.troubleshooter.AutomaticTroubleshooterFactory;
+import org.apache.gobblin.runtime.troubleshooter.IssueRepository;
 import org.apache.gobblin.runtime.util.JobMetrics;
 import org.apache.gobblin.source.Source;
 import org.apache.gobblin.source.WorkUnitStreamSource;
@@ -92,13 +97,14 @@ import org.apache.gobblin.source.workunit.BasicWorkUnitStream;
 import org.apache.gobblin.source.workunit.MultiWorkUnit;
 import org.apache.gobblin.source.workunit.WorkUnit;
 import org.apache.gobblin.source.workunit.WorkUnitStream;
-import org.apache.gobblin.util.ClassAliasResolver;
 import org.apache.gobblin.util.ClusterNameTags;
 import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.util.ExecutorsUtils;
 import org.apache.gobblin.util.Id;
 import org.apache.gobblin.util.JobLauncherUtils;
 import org.apache.gobblin.util.ParallelRunner;
+import org.apache.gobblin.util.PropertiesUtils;
+import org.apache.gobblin.util.reflection.GobblinConstructorUtils;
 import org.apache.gobblin.writer.initializer.WriterInitializerFactory;
 
 
@@ -120,6 +126,8 @@ public abstract class AbstractJobLauncher implements JobLauncher {
   public static final String MULTI_WORK_UNIT_FILE_EXTENSION = ".mwu";
 
   public static final String GOBBLIN_JOB_TEMPLATE_KEY = "gobblin.template.uri";
+
+  public static final String NUM_WORKUNITS = "numWorkUnits";
 
   /** Making {@link AbstractJobLauncher} capable of loading multiple job templates.
    * Keep the original {@link #GOBBLIN_JOB_TEMPLATE_KEY} for backward-compatibility.
@@ -165,7 +173,9 @@ public abstract class AbstractJobLauncher implements JobLauncher {
   private final List<JobListener> mandatoryJobListeners = Lists.newArrayList();
 
   // Used to generate additional metadata to emit in timing events
-  private final EventMetadataGenerator eventMetadataGenerator;
+  private final MultiEventMetadataGenerator multiEventMetadataGenerator;
+
+  private final AutomaticTroubleshooter troubleshooter;
 
   public AbstractJobLauncher(Properties jobProps, List<? extends Tag<?>> metadataTags)
       throws Exception {
@@ -183,6 +193,9 @@ public abstract class AbstractJobLauncher implements JobLauncher {
     clusterNameTags.addAll(Tag.fromMap(ClusterNameTags.getClusterNameTags()));
     GobblinMetrics.addCustomTagsToProperties(jobProps, clusterNameTags);
 
+    troubleshooter = AutomaticTroubleshooterFactory.createForJob(ConfigUtils.propertiesToConfig(jobProps));
+    troubleshooter.start();
+
     // Make a copy for both the system and job configuration properties and resolve the job-template if any.
     this.jobProps = new Properties();
     this.jobProps.putAll(jobProps);
@@ -194,11 +207,13 @@ public abstract class AbstractJobLauncher implements JobLauncher {
     }
 
     try {
+      setDefaultAuthenticator(this.jobProps);
+
       if (instanceBroker == null) {
         instanceBroker = createDefaultInstanceBroker(jobProps);
       }
 
-      this.jobContext = new JobContext(this.jobProps, LOG, instanceBroker);
+      this.jobContext = new JobContext(this.jobProps, LOG, instanceBroker, troubleshooter.getIssueRepository());
       this.eventBus.register(this.jobContext);
 
       this.cancellationExecutor = Executors.newSingleThreadExecutor(
@@ -220,23 +235,26 @@ public abstract class AbstractJobLauncher implements JobLauncher {
       JobExecutionEventSubmitter jobExecutionEventSubmitter = new JobExecutionEventSubmitter(this.eventSubmitter);
       this.mandatoryJobListeners.add(new JobExecutionEventSubmitterListener(jobExecutionEventSubmitter));
 
-      String eventMetadatadataGeneratorClassName =
-          jobProps.getProperty(ConfigurationKeys.EVENT_METADATA_GENERATOR_CLASS_KEY,
-              ConfigurationKeys.DEFAULT_EVENT_METADATA_GENERATOR_CLASS_KEY);
-      try {
-        ClassAliasResolver<EventMetadataGenerator> aliasResolver =
-            new ClassAliasResolver<>(EventMetadataGenerator.class);
-        this.eventMetadataGenerator = aliasResolver.resolveClass(eventMetadatadataGeneratorClassName).newInstance();
-      } catch (ReflectiveOperationException e) {
-        throw new RuntimeException("Could not construct EventMetadataGenerator " +
-            eventMetadatadataGeneratorClassName, e);
-      }
+      this.multiEventMetadataGenerator = new MultiEventMetadataGenerator(
+          PropertiesUtils.getPropAsList(jobProps, ConfigurationKeys.EVENT_METADATA_GENERATOR_CLASS_KEY,
+              ConfigurationKeys.DEFAULT_EVENT_METADATA_GENERATOR_CLASS_KEY));
     } catch (Exception e) {
       unlockJob();
       throw e;
     }
   }
 
+  /**
+   * Set default {@link Authenticator} to the one provided in {@link ConfigurationKeys#DEFAULT_AUTHENTICATOR_CLASS},
+   * calling the constructor using the provided {@link Properties}
+   */
+  public static void setDefaultAuthenticator(Properties properties) {
+    String authenticatorClass = properties.getProperty(ConfigurationKeys.DEFAULT_AUTHENTICATOR_CLASS);
+    if (!Strings.isNullOrEmpty(authenticatorClass)) {
+      Authenticator authenticator = GobblinConstructorUtils.invokeConstructor(Authenticator.class, authenticatorClass, properties);
+      Authenticator.setDefault(authenticator);
+    }
+  }
 
   /**
    * To supporting 'gobblin.template.uri' in any types of jobLauncher, place this resolution as a public-static method
@@ -412,12 +430,12 @@ public abstract class AbstractJobLauncher implements JobLauncher {
         } else {
           workUnitStream = new BasicWorkUnitStream.Builder(source.getWorkunits(jobState)).build();
         }
-        workUnitsCreationTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext,
+        workUnitsCreationTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext,
             EventName.WORK_UNITS_CREATION));
 
         if (this.runtimeMetricContext.isPresent()) {
           String workunitCreationGaugeName = MetricRegistry
-              .name(MetricReportUtils.GOBBLIN_JOB_METRICS_PREFIX, TimingEvent.LauncherTimings.WORK_UNITS_CREATION,
+              .name(ServiceMetricNames.GOBBLIN_JOB_METRICS_PREFIX, TimingEvent.LauncherTimings.WORK_UNITS_CREATION,
                   jobState.getJobName());
           long workUnitsCreationTime = workUnitsCreationTimer.getDuration() / TimeUnit.SECONDS.toMillis(1);
           ContextAwareGauge<Integer> workunitCreationGauge = this.runtimeMetricContext.get()
@@ -431,6 +449,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
           jobState.setState(JobState.RunningState.FAILED);
           String errMsg = "Failed to get work units for job " + jobId;
           this.jobContext.getJobState().setJobFailureMessage(errMsg);
+          this.jobContext.getJobState().setProp(NUM_WORKUNITS, 0);
           throw new JobException(errMsg);
         }
 
@@ -440,9 +459,14 @@ public abstract class AbstractJobLauncher implements JobLauncher {
           LOG.warn("No work units have been created for job " + jobId);
           jobState.setState(JobState.RunningState.COMMITTED);
           isWorkUnitsEmpty = true;
+          this.jobContext.getJobState().setProp(NUM_WORKUNITS, 0);
           return;
         }
 
+        // Perform work needed before writing is done
+        Boolean canCleanUp = this.canCleanStagingData(this.jobContext.getJobState());
+        closer.register(new DestinationDatasetHandlerService(jobState, canCleanUp, this.eventSubmitter))
+            .executeHandlers(workUnitStream);
         //Initialize writer and converter(s)
         closer.register(WriterInitializerFactory.newInstace(jobState, workUnitStream)).initialize();
         closer.register(ConverterInitializerFactory.newInstance(jobState, workUnitStream)).initialize();
@@ -453,7 +477,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
         // important if the current batch of WorkUnits include failed WorkUnits from the previous
         // run which may still have left-over staging data not cleaned up yet.
         cleanLeftoverStagingData(workUnitStream, jobState);
-        stagingDataCleanTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext,
+        stagingDataCleanTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext,
             EventName.MR_STAGING_DATA_CLEAN));
 
         long startTime = System.currentTimeMillis();
@@ -486,6 +510,10 @@ public abstract class AbstractJobLauncher implements JobLauncher {
             }
           });
 
+          // If it is a streaming source, workunits cannot be counted
+          this.jobContext.getJobState().setProp(NUM_WORKUNITS,
+              workUnitStream.isSafeToMaterialize() ? workUnitStream.getMaterializedWorkUnitCollection().size() : 0);
+
           // dump the work unit if tracking logs are enabled
           if (jobState.getPropAsBoolean(ConfigurationKeys.WORK_UNIT_ENABLE_TRACKING_LOGS)) {
             workUnitStream = workUnitStream.transform(new Function<WorkUnit, WorkUnit>() {
@@ -498,7 +526,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
             });
           }
 
-          workUnitsPreparationTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext,
+          workUnitsPreparationTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext,
               EventName.WORK_UNITS_PREPARATION));
 
           // Write job execution info to the job history store before the job starts to run
@@ -507,7 +535,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
           TimingEvent jobRunTimer = this.eventSubmitter.getTimingEvent(TimingEvent.LauncherTimings.JOB_RUN);
           // Start the job and wait for it to finish
           runWorkUnitStream(workUnitStream);
-          jobRunTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext,EventName.JOB_RUN));
+          jobRunTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext,EventName.JOB_RUN));
 
           this.eventSubmitter
               .submit(CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, "JOB_" + jobState.getState()));
@@ -522,7 +550,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
           this.jobContext.finalizeJobStateBeforeCommit();
           this.jobContext.commit();
           postProcessJobState(jobState);
-          jobCommitTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext, EventName.JOB_COMMIT));
+          jobCommitTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext, EventName.JOB_COMMIT));
         } finally {
           long endTime = System.currentTimeMillis();
           jobState.setEndTime(endTime);
@@ -530,18 +558,26 @@ public abstract class AbstractJobLauncher implements JobLauncher {
         }
       } catch (Throwable t) {
         jobState.setState(JobState.RunningState.FAILED);
-        String errMsg = "Failed to launch and run job " + jobId;
+        String errMsg = "Failed to launch and run job " + jobId + " due to" + t.getMessage();
         LOG.error(errMsg + ": " + t, t);
         this.jobContext.getJobState().setJobFailureException(t);
       } finally {
         try {
+          troubleshooter.refineIssues();
+          troubleshooter.logIssueSummary();
+          troubleshooter.reportJobIssuesAsEvents(eventSubmitter);
+        } catch (Exception e) {
+          LOG.error("Failed to report issues", e);
+        }
+
+        try {
           TimingEvent jobCleanupTimer = this.eventSubmitter.getTimingEvent(TimingEvent.LauncherTimings.JOB_CLEANUP);
           cleanupStagingData(jobState);
-          jobCleanupTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext, EventName.JOB_CLEANUP));
+          jobCleanupTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext, EventName.JOB_CLEANUP));
           // Write job execution info to the job history store upon job termination
           this.jobContext.storeJobExecutionInfo();
         } finally {
-          launchJobTimer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext, EventName.FULL_JOB_EXECUTION));
+          launchJobTimer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext, EventName.FULL_JOB_EXECUTION));
           if (isWorkUnitsEmpty) {
             //If no WorkUnits are created, first send the JobCompleteTimer event.
             notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_COMPLETE, new JobListenerAction() {
@@ -559,44 +595,44 @@ public abstract class AbstractJobLauncher implements JobLauncher {
                 jobListener.onJobFailure(jobContext);
               }
             });
+          } else {
+            for (JobState.DatasetState datasetState : this.jobContext.getDatasetStatesByUrns().values()) {
+              // Set the overall job state to FAILED if the job failed to process any dataset
+              if (datasetState.getState() == JobState.RunningState.FAILED) {
+                jobState.setState(JobState.RunningState.FAILED);
+                LOG.warn("At least one dataset state is FAILED. Setting job state to FAILED.");
+                break;
+              }
+            }
+
+            notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_COMPLETE, new JobListenerAction() {
+              @Override
+              public void apply(JobListener jobListener, JobContext jobContext)
+                  throws Exception {
+                jobListener.onJobCompletion(jobContext);
+              }
+            });
+
+            if (jobState.getState() == JobState.RunningState.FAILED || jobState.getState() == JobState.RunningState.CANCELLED) {
+              notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_FAILED, new JobListenerAction() {
+                @Override
+                public void apply(JobListener jobListener, JobContext jobContext)
+                    throws Exception {
+                  jobListener.onJobFailure(jobContext);
+                }
+              });
+              throw new JobException(String.format("Job %s failed", jobId));
+            } else {
+              notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_SUCCEEDED, new JobListenerAction() {
+                @Override
+                public void apply(JobListener jobListener, JobContext jobContext)
+                    throws Exception {
+                  jobListener.onJobFailure(jobContext);
+                }
+              });
+            }
           }
         }
-      }
-
-      for (JobState.DatasetState datasetState : this.jobContext.getDatasetStatesByUrns().values()) {
-        // Set the overall job state to FAILED if the job failed to process any dataset
-        if (datasetState.getState() == JobState.RunningState.FAILED) {
-          jobState.setState(JobState.RunningState.FAILED);
-          LOG.warn("At least one dataset state is FAILED. Setting job state to FAILED.");
-          break;
-        }
-      }
-
-      notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_COMPLETE, new JobListenerAction() {
-        @Override
-        public void apply(JobListener jobListener, JobContext jobContext)
-            throws Exception {
-          jobListener.onJobCompletion(jobContext);
-        }
-      });
-
-      if (jobState.getState() == JobState.RunningState.FAILED) {
-        notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_FAILED, new JobListenerAction() {
-          @Override
-          public void apply(JobListener jobListener, JobContext jobContext)
-              throws Exception {
-            jobListener.onJobFailure(jobContext);
-          }
-        });
-        throw new JobException(String.format("Job %s failed", jobId));
-      } else {
-        notifyListeners(this.jobContext, jobListener, TimingEvent.LauncherTimings.JOB_SUCCEEDED, new JobListenerAction() {
-          @Override
-          public void apply(JobListener jobListener, JobContext jobContext)
-              throws Exception {
-            jobListener.onJobFailure(jobContext);
-          }
-        });
       }
     } finally {
       // Stop metrics reporting
@@ -626,7 +662,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
    * Subclasses can override this method to do whatever processing on the {@link TaskState}s,
    * e.g., aggregate task-level metrics into job-level metrics.
    *
-   * @deprecated Use {@link #postProcessJobState(JobState)
+   * @deprecated Use {@link #postProcessJobState(JobState)}
    */
   @Deprecated
   protected void postProcessTaskStates(@SuppressWarnings("unused") List<TaskState> taskStates) {
@@ -644,6 +680,9 @@ public abstract class AbstractJobLauncher implements JobLauncher {
   @Override
   public void close()
       throws IOException {
+
+    troubleshooter.stop();
+
     try {
       this.cancellationExecutor.shutdownNow();
       try {
@@ -714,6 +753,8 @@ public abstract class AbstractJobLauncher implements JobLauncher {
 
   /**
    * Execute the job cancellation.
+   * The implementation should not throw any exceptions because that will kill the `Cancellation Executor` thread
+   * and will create a deadlock.
    */
   protected abstract void executeCancellation();
 
@@ -982,6 +1023,10 @@ public abstract class AbstractJobLauncher implements JobLauncher {
     return this.jobContext.getSource().isEarlyStopped();
   }
 
+  protected IssueRepository getIssueRepository() {
+    return troubleshooter.getIssueRepository();
+  }
+
   /**
    * Staging data cannot be cleaned if exactly once semantics is used, and the job has unfinished
    * commit sequences.
@@ -1031,7 +1076,7 @@ public abstract class AbstractJobLauncher implements JobLauncher {
       throw new JobException("Failed to execute all JobListeners", e);
     } finally {
       LOG.info("Submitting {}", timerEventName);
-      timer.stop(this.eventMetadataGenerator.getMetadata(this.jobContext,
+      timer.stop(this.multiEventMetadataGenerator.getMetadata(this.jobContext,
           EventName.getEnumFromEventId(timerEventName)));
     }
   }

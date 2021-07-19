@@ -140,6 +140,7 @@ public class ConfigurationKeys {
   public static final String FLOW_ALLOW_CONCURRENT_EXECUTION = "flow.allowConcurrentExecution";
   public static final String FLOW_EXPLAIN_KEY = "flow.explain";
   public static final String FLOW_UNSCHEDULE_KEY = "flow.unschedule";
+  public static final String FLOW_OWNING_GROUP_KEY = "flow.owningGroup";
 
   /**
    * Common topology configuration properties.
@@ -207,11 +208,18 @@ public class ConfigurationKeys {
   public static final String CLEANUP_OLD_JOBS_DATA = "cleanup.old.job.data";
   public static final boolean DEFAULT_CLEANUP_OLD_JOBS_DATA = false;
   public static final String MAXIMUM_JAR_COPY_RETRY_TIMES_KEY = JOB_JAR_FILES_KEY + ".uploading.retry.maximum";
+  public static final String USER_DEFINED_STATIC_STAGING_DIR = "user.defined.static.staging.dir";
+  public static final String USER_DEFINED_STAGING_DIR_FLAG = "user.defined.staging.dir.flag";
 
   public static final String QUEUED_TASK_TIME_MAX_SIZE = "taskexecutor.queued_task_time.history.max_size";
   public static final int DEFAULT_QUEUED_TASK_TIME_MAX_SIZE = 2048;
   public static final String QUEUED_TASK_TIME_MAX_AGE = "taskexecutor.queued_task_time.history.max_age";
   public static final long DEFAULT_QUEUED_TASK_TIME_MAX_AGE = TimeUnit.HOURS.toMillis(1);
+
+  /**
+   * Optional property to specify a default Authenticator class for a job
+   */
+  public static final String DEFAULT_AUTHENTICATOR_CLASS = "job.default.authenticator.class";
 
   /** Optional, for user to specified which template to use, inside .job file */
   public static final String JOB_TEMPLATE_PATH = "job.template";
@@ -244,9 +252,14 @@ public class ConfigurationKeys {
   public static final String TASK_ATTEMPT_ID_KEY = "task.AttemptId";
   public static final String JOB_CONFIG_FILE_PATH_KEY = "job.config.path";
   public static final String TASK_FAILURE_EXCEPTION_KEY = "task.failure.exception";
+  public static final String TASK_ISSUES_KEY = "task.issues";
   public static final String JOB_FAILURE_EXCEPTION_KEY = "job.failure.exception";
   public static final String TASK_RETRIES_KEY = "task.retries";
   public static final String TASK_IGNORE_CLOSE_FAILURES = "task.ignoreCloseFailures";
+  //A boolean config to allow skipping task interrupt on cancellation. Useful for example when thread manages
+  // a Kafka consumer which when interrupted during a poll() leaves the consumer in a corrupt state that prevents
+  // the consumer being closed subsequently, leading to a potential resource leak.
+  public static final String TASK_INTERRUPT_ON_CANCEL = "task.interruptOnCancel";
   public static final String JOB_FAILURES_KEY = "job.failures";
   public static final String JOB_TRACKING_URL_KEY = "job.tracking.url";
   public static final String FORK_STATE_KEY = "fork.state";
@@ -296,6 +309,7 @@ public class ConfigurationKeys {
   public static final String EXTRACT_TABLE_NAME_KEY = "extract.table.name";
   public static final String EXTRACT_EXTRACT_ID_KEY = "extract.extract.id";
   public static final String EXTRACT_IS_FULL_KEY = "extract.is.full";
+  public static final String DEFAULT_EXTRACT_IS_FULL = "false";
   public static final String EXTRACT_FULL_RUN_TIME_KEY = "extract.full.run.time";
   public static final String EXTRACT_PRIMARY_KEY_FIELDS_KEY = "extract.primary.key.fields";
   public static final String EXTRACT_DELTA_FIELDS_KEY = "extract.delta.fields";
@@ -348,6 +362,11 @@ public class ConfigurationKeys {
   public static final String DEFAULT_FORK_RECORD_QUEUE_TIMEOUT_UNIT = TimeUnit.MILLISECONDS.name();
   public static final String FORK_MAX_WAIT_MININUTES = "fork.max.wait.minutes";
   public static final long DEFAULT_FORK_MAX_WAIT_MININUTES = 60;
+  public static final String FORK_FINISHED_CHECK_INTERVAL = "fork.finished.check.interval";
+  public static final long DEFAULT_FORK_FINISHED_CHECK_INTERVAL = 1000;
+  public static final String FORK_CLOSE_WRITER_ON_COMPLETION = "fork.closeWriterOnCompletion";
+  public static final boolean DEFAULT_FORK_CLOSE_WRITER_ON_COMPLETION = false;
+
 
   /**
    * Writer configuration properties.
@@ -475,8 +494,12 @@ public class ConfigurationKeys {
   public static final String DATA_PUBLISHER_REPLACE_FINAL_DIR = DATA_PUBLISHER_PREFIX + ".replace.final.dir";
   public static final String DATA_PUBLISHER_FINAL_NAME = DATA_PUBLISHER_PREFIX + ".final.name";
   public static final String DATA_PUBLISHER_OVERWRITE_ENABLED = DATA_PUBLISHER_PREFIX + ".overwrite.enabled";
-  // This property is used to specify the owner group of the data publisher final output directory
+  // @DATA_PUBLISHER_FINAL_DIR is the final publishing root directory
+  // @DATA_PUBLISHER_FINAL_DIR_GROUP is set at the leaf level (DATA_PUBLISHER_FINAL_DIR/EXTRACT/file.xxx) which is incorrect
+  // Use @DATA_PUBLISHER_OUTPUT_DIR_GROUP to set group at output dir level @DATA_PUBLISHER_FINAL_DIR/EXTRACT
+  @Deprecated
   public static final String DATA_PUBLISHER_FINAL_DIR_GROUP = DATA_PUBLISHER_PREFIX + ".final.dir.group";
+  public static final String DATA_PUBLISHER_OUTPUT_DIR_GROUP = DATA_PUBLISHER_PREFIX + ".output.dir.group";
   public static final String DATA_PUBLISHER_PERMISSIONS = DATA_PUBLISHER_PREFIX + ".permissions";
   public static final String PUBLISH_DATA_AT_JOB_LEVEL = "publish.data.at.job.level";
   public static final boolean DEFAULT_PUBLISH_DATA_AT_JOB_LEVEL = true;
@@ -487,6 +510,12 @@ public class ConfigurationKeys {
       DATA_PUBLISHER_PREFIX + ".latest.file.arrival.timestamp";
 
   /**
+   * Dynamically configured Publisher properties used internally
+   */
+  //Dataset-specific final publish location
+  public static final String DATA_PUBLISHER_DATASET_DIR = DATA_PUBLISHER_PREFIX + ".dataset.dir";
+
+  /**
    * Configuration properties used by the extractor.
    */
   public static final String SOURCE_ENTITY = "source.entity";
@@ -494,6 +523,10 @@ public class ConfigurationKeys {
   public static final boolean DEFAULT_SCHEMA_IN_SOURCE_DIR = false;
   public static final String SCHEMA_FILENAME = "schema.filename";
   public static final String DEFAULT_SCHEMA_FILENAME = "metadata.json";
+  // An optional configuration for extractor's specific implementation to set, which helps data writer
+  // tune some parameters that are relevant to the record size.
+  // See the reference GobblinOrcWriter as an example.
+  public static final String AVG_RECORD_SIZE = "avg.record.size";
 
   // Comma-separated source entity names
   public static final String SOURCE_ENTITIES = "source.entities";
@@ -683,6 +716,19 @@ public class ConfigurationKeys {
   public static final String METRICS_REPORTING_CONFIGURATIONS_PREFIX = "metrics.reporting";
   public static final String METRICS_REPORTING_EVENTS_CONFIGURATIONS_PREFIX =
       METRICS_REPORTING_CONFIGURATIONS_PREFIX + ".events";
+
+  //Configuration keys to trigger job/task failures on metric reporter instantiation failures. Useful
+  //when monitoring of Gobblin pipelines critically depend on events and metrics emitted by the metrics
+  //reporting service running in each container.
+  public static final String GOBBLIN_TASK_METRIC_REPORTING_FAILURE_FATAL = "gobblin.task.isMetricReportingFailureFatal";
+  public static final boolean DEFAULT_GOBBLIN_TASK_METRIC_REPORTING_FAILURE_FATAL = false;
+  public static final String GOBBLIN_TASK_EVENT_REPORTING_FAILURE_FATAL = "gobblin.task.isEventReportingFailureFatal";
+  public static final boolean DEFAULT_GOBBLIN_TASK_EVENT_REPORTING_FAILURE_FATAL = false;
+  public static final String GOBBLIN_JOB_METRIC_REPORTING_FAILURE_FATAL = "gobblin.job.isMetricReportingFailureFatal";
+  public static final boolean DEFAULT_GOBBLIN_JOB_METRIC_REPORTING_FAILURE_FATAL = false;
+  public static final String GOBBLIN_JOB_EVENT_REPORTING_FAILURE_FATAL = "gobblin.job.isEventReportingFailureFatal";
+  public static final boolean DEFAULT_GOBBLIN_JOB_EVENT_REPORTING_FAILURE_FATAL = false;
+
   // File-based reporting
   public static final String METRICS_REPORTING_FILE_ENABLED_KEY =
       METRICS_CONFIGURATIONS_PREFIX + "reporting.file.enabled";
@@ -704,7 +750,10 @@ public class ConfigurationKeys {
       METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.enabled";
   public static final String DEFAULT_METRICS_REPORTING_KAFKA_ENABLED = Boolean.toString(false);
   public static final String DEFAULT_METRICS_REPORTING_KAFKA_REPORTER_CLASS =
-      "org.apache.gobblin.metrics.kafka.KafkaReporterFactory";
+      "org.apache.gobblin.metrics.kafka.KafkaMetricReporterFactory";
+  public static final String DEFAULT_EVENTS_REPORTING_KAFKA_REPORTER_CLASS =
+      "org.apache.gobblin.metrics.kafka.KafkaEventReporterFactory";
+
   public static final String METRICS_REPORTING_KAFKA_FORMAT = METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.format";
   public static final String METRICS_REPORTING_EVENTS_KAFKA_FORMAT =
       METRICS_CONFIGURATIONS_PREFIX + "reporting.events.kafka.format";
@@ -715,11 +764,16 @@ public class ConfigurationKeys {
   public static final String DEFAULT_METRICS_REPORTING_KAFKA_FORMAT = "json";
   public static final String METRICS_REPORTING_KAFKA_USE_SCHEMA_REGISTRY =
       METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.avro.use.schema.registry";
+  public static final String METRICS_REPORTING_EVENTS_KAFKA_AVRO_SCHEMA_ID =
+      METRICS_CONFIGURATIONS_PREFIX + "reporting.events.kafka.avro.schemaId";
+  public static final String METRICS_REPORTING_METRICS_KAFKA_AVRO_SCHEMA_ID =
+      METRICS_CONFIGURATIONS_PREFIX + "reporting.metrics.kafka.avro.schemaId";
+
   public static final String DEFAULT_METRICS_REPORTING_KAFKA_USE_SCHEMA_REGISTRY = Boolean.toString(false);
   public static final String METRICS_KAFKA_BROKERS = METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.brokers";
   // Topic used for both event and metric reporting.
   // Can be overriden by METRICS_KAFKA_TOPIC_METRICS and METRICS_KAFKA_TOPIC_EVENTS.
-  public static final String METRICS_KAFKA_TOPIC = METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.topic";
+  public static final String METRICS_KAFKA_TOPIC = METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.topic.common";
   // Topic used only for metric reporting.
   public static final String METRICS_KAFKA_TOPIC_METRICS =
       METRICS_CONFIGURATIONS_PREFIX + "reporting.kafka.topic.metrics";
@@ -823,12 +877,22 @@ public class ConfigurationKeys {
   public static final String SHARED_KAFKA_CONFIG_PREFIX = "gobblin.kafka.sharedConfig";
 
   /**
-   * Kafka schema registry
+   * Kafka schema registry HTTP client configuration
    */
   public static final String KAFKA_SCHEMA_REGISTRY_HTTPCLIENT_SO_TIMEOUT =
       "kafka.schema.registry.httpclient.so.timeout";
   public static final String KAFKA_SCHEMA_REGISTRY_HTTPCLIENT_CONN_TIMEOUT =
       "kafka.schema.registry.httpclient.conn.timeout";
+  public static final String KAFKA_SCHEMA_REGISTRY_HTTPCLIENT_METHOD_RETRY_COUNT =
+      "kafka.schema.registry.httpclient.methodRetryCount";
+  public static final String KAFKA_SCHEMA_REGISTRY_HTTPCLIENT_REQUEST_RETRY_ENABLED =
+      "kafka.schema.registry.httpclient.requestRetryEnabled";
+  public static final String KAFKA_SCHEMA_REGISTRY_HTTPCLIENT_METHOD_RETRY_HANDLER_CLASS =
+      "kafka.schema.registry.httpclient.methodRetryHandlerClass";
+
+  /**
+   * Kafka schema registry retry configurations
+   */
   public static final String KAFKA_SCHEMA_REGISTRY_RETRY_TIMES = "kafka.schema.registry.retry.times";
   public static final String KAFKA_SCHEMA_REGISTRY_RETRY_INTERVAL_IN_MILLIS =
       "kafka.schema.registry.retry.interval.inMillis";
@@ -885,6 +949,8 @@ public class ConfigurationKeys {
   public static final String AZKABAN_FLOW_URL = "azkaban.link.workflow.url";
   public static final String AZKABAN_JOB_URL = "azkaban.link.job.url";
   public static final String AZKABAN_JOB_EXEC_URL = "azkaban.link.jobexec.url";
+  public static final String AZKABAN_WEBSERVERHOST = "azkaban.webserverhost";
+  public static final String AZKABAN_SERVER_NAME = "azkaban.server.name";
 
   /**
    * Hive registration properties
@@ -908,6 +974,9 @@ public class ConfigurationKeys {
   public static final Charset DEFAULT_CHARSET_ENCODING = Charsets.UTF_8;
   public static final String TEST_HARNESS_LAUNCHER_IMPL = "gobblin.testharness.launcher.impl";
   public static final int PERMISSION_PARSING_RADIX = 8;
+  // describes a comma separated list of non transient errors that may come in a gobblin job
+  // e.g. "invalid_grant,CredentialStoreException"
+  public static final String GOBBLIN_NON_TRANSIENT_ERRORS = "gobblin.errorMessages.nonTransientErrors";
 
   /**
    * Configuration properties related to Flows
@@ -956,6 +1025,12 @@ public class ConfigurationKeys {
   public static final String COMPACTION_PRIORITIZER_ALIAS = COMPACTION_PRIORITIZATION_PREFIX + "prioritizerAlias";
   public static final String COMPACTION_ESTIMATOR = COMPACTION_PRIORITIZATION_PREFIX + "estimator";
 
+  /***
+   * Configuration properties related to Re-compaction
+   */
+  public static String RECOMPACTION_WRITE_TO_NEW_FOLDER = "recompaction.write.to.new.folder";
+
+
   /**
    * Configuration related to ConfigStore based copy/retention
    */
@@ -990,8 +1065,49 @@ public class ConfigurationKeys {
       "org.apache.gobblin.util.schema_check.AvroSchemaCheckDefaultStrategy";
 
   /**
+   * Configuration and constant vale for GobblinMetadataChangeEvent
+   */
+  public static final String GOBBLIN_METADATA_CHANGE_EVENT_ENABLED = "GobblinMetadataChangeEvent.enabled";
+  public static final String LIST_DELIMITER_KEY = ",";
+  public static final String RANGE_DELIMITER_KEY = "-";
+
+  /**
    * Configuration for emitting task events
    */
   public static final String TASK_EVENT_METADATA_GENERATOR_CLASS_KEY = "gobblin.task.event.metadata.generator.class";
   public static final String DEFAULT_TASK_EVENT_METADATA_GENERATOR_CLASS_KEY = "nooptask";
+
+  /**
+   * Configuration for sharded directory files
+   */
+  public static final String USE_DATASET_LOCAL_WORK_DIR = "gobblin.useDatasetLocalWorkDir";
+  public static final String DESTINATION_DATASET_HANDLER_CLASS = "gobblin.destination.datasetHandlerClass";
+  public static final String DATASET_DESTINATION_PATH = "gobblin.dataset.destination.path";
+  public static final String TMP_DIR = ".temp";
+  public static final String STAGING_DIR_DEFAULT_SUFFIX = "/" + TMP_DIR + "/taskStaging";
+  public static final String OUTPUT_DIR_DEFAULT_SUFFIX = "/" + TMP_DIR + "/taskOutput";
+  public static final String ROW_LEVEL_ERR_FILE_DEFAULT_SUFFIX = "/err";
+
+
+  /**
+   * Troubleshooter configuration
+   */
+
+  /**
+   * Disables all troubleshooter functions
+   * */
+  public static final String TROUBLESHOOTER_DISABLED = "gobblin.troubleshooter.disabled";
+
+  /**
+   * Disables reporting troubleshooter issues as GobblinTrackingEvents
+   * */
+  public static final String TROUBLESHOOTER_DISABLE_EVENT_REPORTING = "gobblin.troubleshooter.disableEventReporting";
+
+  /**
+   * The maximum number of issues that In-memory troubleshooter repository will keep.
+   *
+   * This setting can control memory usage of the troubleshooter.
+   * */
+  public static final String TROUBLESHOOTER_IN_MEMORY_ISSUE_REPOSITORY_MAX_SIZE = "gobblin.troubleshooter.inMemoryIssueRepository.maxSize";
+  public static final int DEFAULT_TROUBLESHOOTER_IN_MEMORY_ISSUE_REPOSITORY_MAX_SIZE = 100;
 }

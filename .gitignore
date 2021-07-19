@@ -10,6 +10,10 @@
 **/*.iws
 **/*.ipr
 .shelf/
+.ideaDataSources/
+
+# VS Code related
+.vscode
 
 **/.classpath
 **/.project
@@ -18,8 +22,7 @@
 **/*.swp
 **/*.swo
 **/*.log
-*/bin
-**/bin
+
 **/build/
 .gradle
 **/.gradle
@@ -46,6 +49,7 @@ out/
 */bin/
 **/mainGeneratedDataTemplate
 **/mainGeneratedRest
+**/main/snapshot
 gobblin-dist/
 gobblin-distribution-*.tar.gz
 gobblin.tar.gz
@@ -70,6 +74,13 @@ ligradle/checkstyle/suppressions.xml
 gobblin-core/src/test/resources/serde/output-staging/
 gobblin-integration-test-log-dir/
 gobblin-modules/gobblin-elasticsearch/test-elasticsearch/
+gobblin-modules/*/bin/
+gobblin-metrics-libs/*/bin/
+gobblin-config-management/*/bin/
+gobblin-cluster/GobblinHelixJobLauncherTest/
+gobblin-restli/gobblin-restli-utils/bin/
+gobblin-test-harness/gobblin-test-harness/
+
 
 temp/
 ligradle/*
@@ -77,3 +88,10 @@ FsDatasetStateStoreTest/
 GobblinHelixTaskTest/
 commit-sequence-store-test/
 gobblin-test-harness/src/test/resources/runtime_test/state_store/
+
+gobblin-integration-test-work-dir/
+
+gobblin-test-utils/src/main/gen-avro/
+gobblin-test-utils/src/main/gen-proto/
+
+gobblin_config/

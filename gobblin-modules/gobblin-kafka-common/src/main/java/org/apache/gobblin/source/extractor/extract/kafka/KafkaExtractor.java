@@ -20,6 +20,8 @@ package org.apache.gobblin.source.extractor.extract.kafka;
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.slf4j.Logger;
@@ -27,6 +29,7 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 import lombok.Getter;
 
@@ -60,6 +63,8 @@ public abstract class KafkaExtractor<S, D> extends EventBasedExtractor<S, D> {
 
   private final ClassAliasResolver<GobblinKafkaConsumerClientFactory> kafkaConsumerClientResolver;
   private final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
+  private final String recordCreationTimestampFieldName;
+  private final TimeUnit recordCreationTimestampUnit;
 
   private Iterator<KafkaConsumerRecord> messageIterator = null;
   @Getter
@@ -101,10 +106,13 @@ public abstract class KafkaExtractor<S, D> extends EventBasedExtractor<S, D> {
     } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
       throw new RuntimeException(e);
     }
-    this.statsTracker = new KafkaExtractorStatsTracker(state,partitions);
+    this.statsTracker = new KafkaExtractorStatsTracker(state, partitions);
 
     // The actual high watermark starts with the low watermark
     this.workUnitState.setActualHighWatermark(this.lowWatermark);
+
+    this.recordCreationTimestampFieldName = this.workUnitState.getProp(KafkaSource.RECORD_CREATION_TIMESTAMP_FIELD, null);
+    this.recordCreationTimestampUnit = TimeUnit.valueOf(this.workUnitState.getProp(KafkaSource.RECORD_CREATION_TIMESTAMP_UNIT, TimeUnit.MILLISECONDS.name()));
   }
 
   @Override
@@ -177,7 +185,9 @@ public abstract class KafkaExtractor<S, D> extends EventBasedExtractor<S, D> {
           D record = decodeKafkaMessage(nextValidMessage);
 
           this.statsTracker.onDecodeableRecord(this.currentPartitionIdx, readStartTime, decodeStartTime,
-              nextValidMessage.getValueSizeInBytes(), nextValidMessage.isTimestampLogAppend() ? nextValidMessage.getTimestamp() : 0L);
+              nextValidMessage.getValueSizeInBytes(), nextValidMessage.isTimestampLogAppend() ? nextValidMessage.getTimestamp() : 0L,
+              (this.recordCreationTimestampFieldName != null) ? nextValidMessage
+                  .getRecordCreationTimestamp(this.recordCreationTimestampFieldName, this.recordCreationTimestampUnit) : 0L);
           this.currentPartitionLastSuccessfulRecord = record;
           return record;
         } catch (Throwable t) {
@@ -311,8 +321,14 @@ public abstract class KafkaExtractor<S, D> extends EventBasedExtractor<S, D> {
     this.workUnitState.setProp(ConfigurationKeys.ERROR_PARTITION_COUNT, this.statsTracker.getErrorPartitionCount());
     this.workUnitState.setProp(ConfigurationKeys.ERROR_MESSAGE_UNDECODABLE_COUNT, this.statsTracker.getUndecodableMessageCount());
     this.workUnitState.setActualHighWatermark(this.nextWatermark);
+
+    // Need to call this even when not emitting metrics because some state, such as the average pull time,
+    // is updated when the tags are generated
+    Map<KafkaPartition, Map<String, String>> tagsForPartitionsMap = this.statsTracker.generateTagsForPartitions(
+        this.lowWatermark, this.highWatermark, this.nextWatermark, Maps.newHashMap());
+
     if (isInstrumentationEnabled()) {
-      this.statsTracker.emitTrackingEvents(getMetricContext(), this.lowWatermark, this.highWatermark, this.nextWatermark);
+      this.statsTracker.emitTrackingEvents(getMetricContext(), tagsForPartitionsMap);
     }
   }
 

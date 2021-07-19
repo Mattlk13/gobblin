@@ -17,11 +17,13 @@
 
 package org.apache.gobblin.salesforce;
 
+import java.util.Iterator;
+import java.util.List;
+
 import com.google.common.collect.Iterators;
 import com.google.gson.JsonElement;
 import com.sforce.async.BulkConnection;
-import java.util.Iterator;
-import java.util.List;
+
 import lombok.extern.slf4j.Slf4j;
 
 
@@ -34,9 +36,12 @@ import lombok.extern.slf4j.Slf4j;
 public class ResultChainingIterator implements Iterator<JsonElement> {
   private Iterator<JsonElement> iter;
   private int recordCount = 0;
+  private int isDeletedRecordCount = 0;
 
-  public ResultChainingIterator(BulkConnection conn, List<FileIdVO> fileIdList, int retryLimit) {
-    Iterator<BulkResultIterator> iterOfFiles = fileIdList.stream().map(x -> new BulkResultIterator(conn, x, retryLimit)).iterator();
+  public ResultChainingIterator(BulkConnection conn, List<FileIdVO> fileIdList, int retryLimit,
+      long retryInterval, long retryExceedQuotaInterval) {
+    Iterator<BulkResultIterator> iterOfFiles = fileIdList.stream().map(x ->
+        new BulkResultIterator(conn, x, retryLimit, retryInterval, retryExceedQuotaInterval)).iterator();
     iter = Iterators.<JsonElement>concat(iterOfFiles);
   }
 
@@ -45,16 +50,13 @@ public class ResultChainingIterator implements Iterator<JsonElement> {
   }
 
   public void add(Iterator<JsonElement> iter) {
-    this.iter = Iterators.concat(this.iter, iter);
+    if (iter != null) {
+      this.iter = Iterators.concat(this.iter, iter);
+    }
   }
 
   @Override
   public boolean hasNext() {
-    if (!iter.hasNext()) {
-      // hasNext is false, means all data in this iterator was fetched
-      // we can print out record total.
-      log.info("====Total records: [{}] ====", recordCount);
-    }
     return iter.hasNext();
   }
 
@@ -62,11 +64,13 @@ public class ResultChainingIterator implements Iterator<JsonElement> {
   public JsonElement next() {
     JsonElement jsonElement = iter.next();
     recordCount ++;
+    JsonElement isDeletedElement = jsonElement.getAsJsonObject().get("IsDeleted");
+    if (isDeletedElement != null && isDeletedElement.getAsBoolean()) {
+      isDeletedRecordCount ++;
+    }
     if (!iter.hasNext()) {
-      // see hasNext.
-      //In case caller may not check hasNext and use next() == null as end of the interator
-      // we can print out total here.
-      log.info("====Total records: [{}] ====", recordCount);
+      // `jsonElement` has last record, print out total and isDeleted=true records(soft deleted) total
+      log.info("====Total records: [{}] isDeleted=true records: [{}]====", recordCount, isDeletedRecordCount);
     }
     return jsonElement;
   }

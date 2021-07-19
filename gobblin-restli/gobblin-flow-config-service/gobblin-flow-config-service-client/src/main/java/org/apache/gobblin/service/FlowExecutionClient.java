@@ -33,6 +33,8 @@ import com.linkedin.r2.RemoteInvocationException;
 import com.linkedin.r2.transport.common.Client;
 import com.linkedin.r2.transport.common.bridge.client.TransportClientAdapter;
 import com.linkedin.r2.transport.http.client.HttpClientFactory;
+import com.linkedin.restli.client.ActionRequest;
+import com.linkedin.restli.client.DeleteRequest;
 import com.linkedin.restli.client.FindRequest;
 import com.linkedin.restli.client.GetRequest;
 import com.linkedin.restli.client.Response;
@@ -128,20 +130,25 @@ public class FlowExecutionClient implements Closeable {
     }
   }
 
+  public List<FlowExecution> getLatestFlowExecution(FlowId flowId, Integer count, String tag) throws RemoteInvocationException {
+    return getLatestFlowExecution(flowId, count, tag, null);
+  }
+
   /**
    * Get the latest k flow executions
    * @param flowId identifier of flow execution to get
    * @return a list of {@link FlowExecution}es corresponding to the latest <code>count</code> executions, containing only
-   * jobStatuses that match the given tag.
+   * jobStatuses that match the given tag. If <code>executionStatus</code> is not null, only flows with that status are
+   * returned.
    * @throws RemoteInvocationException
    */
-  public List<FlowExecution> getLatestFlowExecution(FlowId flowId, Integer count, String tag)
+  public List<FlowExecution> getLatestFlowExecution(FlowId flowId, Integer count, String tag, String executionStatus)
       throws RemoteInvocationException {
     LOG.debug("getFlowExecution with groupName " + flowId.getFlowGroup() + " flowName " +
         flowId.getFlowName() + " count " + Integer.toString(count));
 
     FindRequest<FlowExecution> findRequest = _flowexecutionsRequestBuilders.findByLatestFlowExecution().flowIdParam(flowId).
-        addReqParam("count", count, Integer.class).addParam("tag", tag, String.class).build();
+        addReqParam("count", count, Integer.class).addParam("tag", tag, String.class).addParam("executionStatus", executionStatus, String.class).build();
 
     Response<CollectionResponse<FlowExecution>> response =
         _restClient.get().sendRequest(findRequest).getResponse();
@@ -155,6 +162,37 @@ public class FlowExecutionClient implements Closeable {
     }
   }
 
+  /**
+   * Resume the flow with given FlowStatusId from it's state before failure
+   * @param flowStatusId identifier of flow execution to resume
+   * @throws RemoteInvocationException
+   */
+  public void resumeFlowExecution(FlowStatusId flowStatusId)
+      throws RemoteInvocationException {
+    LOG.debug("resumeFlowExecution with groupName " + flowStatusId.getFlowGroup() + " flowName " +
+        flowStatusId.getFlowName() + " flowExecutionId " + flowStatusId.getFlowExecutionId());
+
+    ActionRequest<Void> resumeRequest = _flowexecutionsRequestBuilders.actionResume()
+        .id(new ComplexResourceKey<>(flowStatusId, new EmptyRecord())).build();
+
+    FlowClientUtils.sendRequestWithRetry(_restClient.get(), resumeRequest, FlowexecutionsRequestBuilders.getPrimaryResource());
+  }
+
+  /**
+   * Kill the flow with given FlowStatusId
+   * @param flowStatusId identifier of flow execution to kill
+   * @throws RemoteInvocationException
+   */
+  public void deleteFlowExecution(FlowStatusId flowStatusId)
+      throws RemoteInvocationException {
+    LOG.debug("deleteFlowExecution with groupName " + flowStatusId.getFlowGroup() + " flowName " +
+        flowStatusId.getFlowName() + " flowExecutionId " + flowStatusId.getFlowExecutionId());
+
+    DeleteRequest<FlowExecution> deleteRequest = _flowexecutionsRequestBuilders.delete()
+        .id(new ComplexResourceKey<>(flowStatusId, new EmptyRecord())).build();
+
+    FlowClientUtils.sendRequestWithRetry(_restClient.get(), deleteRequest, FlowexecutionsRequestBuilders.getPrimaryResource());
+  }
 
   @Override
   public void close()

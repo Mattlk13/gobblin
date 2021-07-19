@@ -18,6 +18,7 @@
 package org.apache.gobblin.service.modules.flow;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,8 +27,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.reflect.ConstructorUtils;
 import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 
@@ -35,6 +38,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.ServiceManager;
 import com.typesafe.config.Config;
@@ -55,11 +59,13 @@ import org.apache.gobblin.service.ServiceConfigKeys;
 import org.apache.gobblin.service.modules.core.GitFlowGraphMonitor;
 import org.apache.gobblin.service.modules.flowgraph.BaseFlowGraph;
 import org.apache.gobblin.service.modules.flowgraph.Dag;
+import org.apache.gobblin.service.modules.flowgraph.DataNode;
 import org.apache.gobblin.service.modules.flowgraph.DatasetDescriptorConfigKeys;
 import org.apache.gobblin.service.modules.flowgraph.FlowGraph;
 import org.apache.gobblin.service.modules.flowgraph.pathfinder.PathFinder;
 import org.apache.gobblin.service.modules.spec.JobExecutionPlan;
 import org.apache.gobblin.service.modules.template_catalog.ObservingFSFlowEdgeTemplateCatalog;
+import org.apache.gobblin.util.ClassAliasResolver;
 import org.apache.gobblin.util.ConfigUtils;
 
 
@@ -80,6 +86,8 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
   private GitFlowGraphMonitor gitFlowGraphMonitor;
 
   private ReadWriteLock rwLock = new ReentrantReadWriteLock(true);
+
+  private DataMovementAuthorizer dataMovementAuthorizer;
 
   public MultiHopFlowCompiler(Config config) {
     this(config, true);
@@ -113,6 +121,15 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
       gitFlowGraphConfig = this.config
           .withValue(GitFlowGraphMonitor.GIT_FLOWGRAPH_MONITOR_PREFIX + "." + ConfigurationKeys.ENCRYPT_KEY_LOC, config.getValue(ConfigurationKeys.ENCRYPT_KEY_LOC));
     }
+
+    try {
+      String dataMovementAuthorizerClassName = ConfigUtils.getString(this.config, ServiceConfigKeys.DATA_MOVEMENT_AUTHORIZER_CLASS,
+          NoopDataMovementAuthorizer.class.getCanonicalName());
+      this.dataMovementAuthorizer = (DataMovementAuthorizer) ConstructorUtils.invokeConstructor(Class.forName(new ClassAliasResolver<>(DataMovementAuthorizer.class).resolve(dataMovementAuthorizerClassName)), this.config);
+    } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | InstantiationException | ClassNotFoundException e) {
+      throw new RuntimeException(e);
+    }
+
     this.gitFlowGraphMonitor = new GitFlowGraphMonitor(gitFlowGraphConfig, flowTemplateCatalog, this.flowGraph, this.topologySpecMap, this.getInitComplete());
     this.serviceManager = new ServiceManager(Lists.newArrayList(this.gitFlowGraphMonitor, flowTemplateCatalog.get()));
     addShutdownHook();
@@ -129,6 +146,7 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
   MultiHopFlowCompiler(Config config, FlowGraph flowGraph) {
     super(config, Optional.absent(), true);
     this.flowGraph = flowGraph;
+    this.dataMovementAuthorizer = new NoopDataMovementAuthorizer(config);
   }
 
   /**
@@ -169,8 +187,12 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
 
     FlowSpec flowSpec = (FlowSpec) spec;
     String source = ConfigUtils.getString(flowSpec.getConfig(), ServiceConfigKeys.FLOW_SOURCE_IDENTIFIER_KEY, "");
-    String destination =
-        ConfigUtils.getString(flowSpec.getConfig(), ServiceConfigKeys.FLOW_DESTINATION_IDENTIFIER_KEY, "");
+    String destination = ConfigUtils.getString(flowSpec.getConfig(), ServiceConfigKeys.FLOW_DESTINATION_IDENTIFIER_KEY, "");
+
+    DataNode sourceNode = this.flowGraph.getNode(source);
+    List<String> destNodeIds = ConfigUtils.getStringList(flowSpec.getConfig(), ServiceConfigKeys.FLOW_DESTINATION_IDENTIFIER_KEY);
+    List<DataNode> destNodes = destNodeIds.stream().map(this.flowGraph::getNode).collect(Collectors.toList());
+
     log.info(String.format("Compiling flow for source: %s and destination: %s", source, destination));
 
     List<FlowSpec> flowSpecs = splitFlowSpec(flowSpec);
@@ -178,6 +200,25 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
     try {
       this.rwLock.readLock().lock();
       for (FlowSpec datasetFlowSpec : flowSpecs) {
+        for (DataNode destNode : destNodes) {
+          long authStartTime = System.nanoTime();
+          try {
+            boolean authorized = this.dataMovementAuthorizer.isMovementAuthorized(flowSpec, sourceNode, destNode);
+            Instrumented.updateTimer(dataAuthorizationTimer, System.nanoTime() - authStartTime, TimeUnit.NANOSECONDS);
+            if (!authorized) {
+              String message = String.format("Data movement is not authorized for flow: %s, source: %s, destination: %s",
+                  flowSpec.getUri().toString(), source, destination);
+              log.error(message);
+              datasetFlowSpec.getCompilationErrors().add(message);
+              return null;
+            }
+          } catch (Exception e) {
+            Instrumented.markMeter(flowCompilationFailedMeter);
+            datasetFlowSpec.getCompilationErrors().add(Throwables.getStackTraceAsString(e));
+            return null;
+          }
+        }
+
         //Compute the path from source to destination.
         FlowGraphPath flowGraphPath = flowGraph.findPath(datasetFlowSpec);
         if (flowGraphPath != null) {
@@ -188,14 +229,16 @@ public class MultiHopFlowCompiler extends BaseFlowToJobSpecCompiler {
 
       if (jobExecutionPlanDag.isEmpty()) {
         Instrumented.markMeter(flowCompilationFailedMeter);
-        log.info(String.format("No path found from source: %s and destination: %s", source, destination));
-        return jobExecutionPlanDag;
+        String message = String.format("No path found from source: %s and destination: %s", source, destination);
+        log.info(message);
+        flowSpec.getCompilationErrors().add(message);
+        return null;
       }
     } catch (PathFinder.PathFinderException | SpecNotFoundException | JobTemplate.TemplateException | URISyntaxException | ReflectiveOperationException e) {
       Instrumented.markMeter(flowCompilationFailedMeter);
-      log.error(String
-              .format("Exception encountered while compiling flow for source: %s and destination: %s", source, destination),
-          e);
+      String message = String.format("Exception encountered while compiling flow for source: %s and destination: %s, %s", source, destination, Throwables.getStackTraceAsString(e));
+      log.error(message, e);
+      flowSpec.getCompilationErrors().add(message);
       return null;
     } finally {
       this.rwLock.readLock().unlock();

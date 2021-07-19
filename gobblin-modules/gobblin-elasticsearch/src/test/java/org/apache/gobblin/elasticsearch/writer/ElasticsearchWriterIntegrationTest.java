@@ -18,21 +18,8 @@ package org.apache.gobblin.elasticsearch.writer;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.commons.math3.util.Pair;
-import org.apache.gobblin.elasticsearch.ElasticsearchTestServer;
-import org.apache.gobblin.test.AvroRecordGenerator;
-import org.apache.gobblin.test.JsonRecordGenerator;
-import org.apache.gobblin.test.PayloadType;
-import org.apache.gobblin.test.RecordTypeGenerator;
-import org.apache.gobblin.test.TestUtils;
-import org.apache.gobblin.writer.AsyncWriterManager;
-import org.apache.gobblin.writer.BatchAsyncDataWriter;
-import org.apache.gobblin.writer.BufferedAsyncDataWriter;
-import org.apache.gobblin.writer.DataWriter;
-import org.apache.gobblin.writer.SequentialBasedBatchAccumulator;
 import org.elasticsearch.action.get.GetRequest;
 import org.elasticsearch.action.get.GetResponse;
 import org.testng.Assert;
@@ -44,6 +31,18 @@ import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
 
 import lombok.extern.slf4j.Slf4j;
+
+import org.apache.gobblin.elasticsearch.ElasticsearchTestServer;
+import org.apache.gobblin.test.AvroRecordGenerator;
+import org.apache.gobblin.test.JsonRecordGenerator;
+import org.apache.gobblin.test.PayloadType;
+import org.apache.gobblin.test.RecordTypeGenerator;
+import org.apache.gobblin.test.TestUtils;
+import org.apache.gobblin.writer.AsyncWriterManager;
+import org.apache.gobblin.writer.BatchAsyncDataWriter;
+import org.apache.gobblin.writer.BufferedAsyncDataWriter;
+import org.apache.gobblin.writer.DataWriter;
+import org.apache.gobblin.writer.SequentialBasedBatchAccumulator;
 
 
 @Slf4j
@@ -62,7 +61,7 @@ public class ElasticsearchWriterIntegrationTest {
     recordGenerators = ImmutableList.of(new AvroRecordGenerator(), new JsonRecordGenerator());
   }
 
-  @BeforeSuite
+  @BeforeSuite(alwaysRun=true)
   public void startServers()
       throws IOException {
     log.error("{}: Starting Elasticsearch Server", pid);
@@ -70,10 +69,12 @@ public class ElasticsearchWriterIntegrationTest {
     _esTestServer.start(60);
   }
 
-  @AfterSuite
+  @AfterSuite(alwaysRun=true)
   public void stopServers() {
     log.error("{}: Stopping Elasticsearch Server", pid);
-    _esTestServer.stop();
+    if (_esTestServer != null ) {
+      _esTestServer.stop();
+    }
   }
 
 

@@ -59,6 +59,8 @@ import org.apache.gobblin.metrics.ServiceMetricNames;
 import org.apache.gobblin.service.modules.flowgraph.Dag;
 import org.apache.gobblin.service.modules.spec.JobExecutionPlan;
 import org.apache.gobblin.util.ConfigUtils;
+import org.apache.gobblin.util.PropertiesUtils;
+
 
 // Provide base implementation for constructing multi-hops route.
 @Alpha
@@ -82,6 +84,8 @@ public abstract class BaseFlowToJobSpecCompiler implements SpecCompiler {
   @Getter
   protected Optional<Timer> flowCompilationTimer;
   @Getter
+  protected Optional<Timer> dataAuthorizationTimer;
+  @Getter
   @Setter
   protected boolean active;
 
@@ -104,12 +108,14 @@ public abstract class BaseFlowToJobSpecCompiler implements SpecCompiler {
       this.flowCompilationSuccessFulMeter = Optional.of(this.metricContext.meter(ServiceMetricNames.FLOW_COMPILATION_SUCCESSFUL_METER));
       this.flowCompilationFailedMeter = Optional.of(this.metricContext.meter(ServiceMetricNames.FLOW_COMPILATION_FAILED_METER));
       this.flowCompilationTimer = Optional.<Timer>of(this.metricContext.timer(ServiceMetricNames.FLOW_COMPILATION_TIMER));
+      this.dataAuthorizationTimer = Optional.<Timer>of(this.metricContext.timer(ServiceMetricNames.DATA_AUTHORIZATION_TIMER));
     }
     else {
       this.metricContext = null;
       this.flowCompilationSuccessFulMeter = Optional.absent();
       this.flowCompilationFailedMeter = Optional.absent();
       this.flowCompilationTimer = Optional.absent();
+      this.dataAuthorizationTimer = Optional.absent();
     }
 
     this.topologySpecMap = Maps.newConcurrentMap();
@@ -222,7 +228,7 @@ public abstract class BaseFlowToJobSpecCompiler implements SpecCompiler {
       jobSpecBuilder = jobSpecBuilder.withTemplate(flowSpec.getTemplateURIs().get().iterator().next());
       try {
         jobSpec = new ResolvedJobSpec(jobSpecBuilder.build(), templateCatalog.get());
-        log.info("Resolved JobSpec properties are: " + jobSpec.getConfigAsProperties());
+        log.info("Resolved JobSpec properties are: " + PropertiesUtils.prettyPrintProperties(jobSpec.getConfigAsProperties()));
       } catch (SpecNotFoundException | JobTemplate.TemplateException e) {
         throw new RuntimeException("Could not resolve template in JobSpec from TemplateCatalog", e);
       }

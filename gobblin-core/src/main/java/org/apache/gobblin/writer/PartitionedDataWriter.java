@@ -52,10 +52,12 @@ import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.State;
 import org.apache.gobblin.dataset.Descriptor;
 import org.apache.gobblin.dataset.PartitionDescriptor;
+import org.apache.gobblin.exception.NonTransientException;
 import org.apache.gobblin.instrumented.writer.InstrumentedDataWriterDecorator;
 import org.apache.gobblin.instrumented.writer.InstrumentedPartitionedDataWriterDecorator;
 import org.apache.gobblin.records.ControlMessageHandler;
 import org.apache.gobblin.stream.ControlMessage;
+import org.apache.gobblin.stream.FlushControlMessage;
 import org.apache.gobblin.stream.MetadataUpdateControlMessage;
 import org.apache.gobblin.stream.RecordEnvelope;
 import org.apache.gobblin.stream.StreamEntity;
@@ -80,6 +82,8 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
   // in incorrect behavior.
   public static final String PARTITIONED_WRITER_CACHE_TTL_SECONDS = "partitionedDataWriter.cache.ttl.seconds";
   public static final Long DEFAULT_PARTITIONED_WRITER_CACHE_TTL_SECONDS = Long.MAX_VALUE;
+  public static final String PARTITIONED_WRITER_WRITE_TIMEOUT_SECONDS = "partitionedDataWriter.write.timeout.seconds";
+  public static final Long DEFAULT_PARTITIONED_WRITER_WRITE_TIMEOUT_SECONDS = Long.MAX_VALUE;
 
   private static final GenericRecord NON_PARTITIONED_WRITER_KEY =
       new GenericData.Record(SchemaBuilder.record("Dummy").fields().endRecord());
@@ -100,6 +104,7 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
   private final ControlMessageHandler controlMessageHandler;
   private boolean isSpeculativeAttemptSafe;
   private boolean isWatermarkCapable;
+  private long writeTimeoutInterval;
 
   private ScheduledExecutorService cacheCleanUpExecutor;
 
@@ -127,6 +132,10 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
       this.state.setProp(WRITER_LATEST_SCHEMA, builder.getSchema());
     }
     long cacheExpiryInterval = this.state.getPropAsLong(PARTITIONED_WRITER_CACHE_TTL_SECONDS, DEFAULT_PARTITIONED_WRITER_CACHE_TTL_SECONDS);
+    this.writeTimeoutInterval = this.state.getPropAsLong(PARTITIONED_WRITER_WRITE_TIMEOUT_SECONDS,
+        DEFAULT_PARTITIONED_WRITER_WRITE_TIMEOUT_SECONDS);
+    // Bound the timeout value to avoid data loss when slow write happening
+    this.writeTimeoutInterval = Math.min(this.writeTimeoutInterval, cacheExpiryInterval / 3 * 2);
     log.debug("PartitionedDataWriter: Setting cache expiry interval to {} seconds", cacheExpiryInterval);
 
     this.partitionWriters = CacheBuilder.newBuilder()
@@ -234,18 +243,25 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
   @Override
   public void writeEnvelope(RecordEnvelope<D> recordEnvelope) throws IOException {
     try {
-      DataWriter<D> writer = getDataWriterForRecord(recordEnvelope.getRecord());
+      GenericRecord partition = getPartitionForRecord(recordEnvelope.getRecord());
+      DataWriter<D> writer = this.partitionWriters.get(partition);
+      long startTime = System.currentTimeMillis();
       writer.writeEnvelope(recordEnvelope);
+      long timeForWriting = System.currentTimeMillis() - startTime;
+      // If the write take a long time, which is 1/3 of cache expiration time, we fail the writer to avoid data loss
+      // and further slowness on the same HDFS block
+      if (timeForWriting / 1000 > this.writeTimeoutInterval ) {
+        //Use NonTransientException to avoid writer retry, in this case, retry will also cause data loss
+        throw new NonTransientException(String.format("Write record took %s s, but threshold is %s s",
+            timeForWriting / 1000, writeTimeoutInterval));
+      }
     } catch (ExecutionException ee) {
       throw new IOException(ee);
     }
   }
 
-  private DataWriter<D> getDataWriterForRecord(D record)
-      throws ExecutionException {
-    GenericRecord partition =
-        this.shouldPartition ? this.partitioner.get().partitionForRecord(record) : NON_PARTITIONED_WRITER_KEY;
-    return this.partitionWriters.get(partition);
+  private GenericRecord getPartitionForRecord(D record) {
+     return this.shouldPartition ? this.partitioner.get().partitionForRecord(record) : NON_PARTITIONED_WRITER_KEY;
   }
 
   @Override
@@ -274,7 +290,7 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
         entry.getValue().cleanup();
         writersCleanedUp++;
       } catch (Throwable throwable) {
-        log.error(String.format("Failed to cleanup writer for partition %s.", entry.getKey()));
+        log.error(String.format("Failed to cleanup writer for partition %s.", entry.getKey()), throwable);
       }
     }
     if (writersCleanedUp < this.partitionWriters.asMap().size()) {
@@ -354,7 +370,7 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
       state.setProp("RecordsWritten", recordsWritten());
       state.setProp("BytesWritten", bytesWritten());
     } catch (Exception exception) {
-      log.warn("Failed to get final state." + exception.getMessage());
+      log.warn("Failed to get final state.", exception);
       // If Writer fails to return bytesWritten, it might not be implemented, or implemented incorrectly.
       // Omit property instead of failing.
     }
@@ -395,6 +411,9 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
             .getGlobalMetadata().getSchema());
         state.setProp(WRITER_LATEST_SCHEMA, ((MetadataUpdateControlMessage) message)
             .getGlobalMetadata().getSchema());
+      } else if (message instanceof FlushControlMessage){
+        //Add Partition info to state to report partition level lineage events on Flush
+        serializePartitionInfoToState();
       }
 
       synchronized (PartitionedDataWriter.this) {
@@ -411,7 +430,7 @@ public class PartitionedDataWriter<S, D> extends WriterWrapper<D> implements Fin
   /**
    * Get the serialized key to partitions info in {@link #state}
    */
-  private static String getPartitionsKey(int branchId) {
+  public static String getPartitionsKey(int branchId) {
     return String.format("writer.%d.partitions", branchId);
   }
 

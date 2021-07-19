@@ -68,7 +68,9 @@ artifacts {
   archives mainDataTemplateJar, dataTemplateSourcesJar, dataTemplateJavadocJar
 }
 
-if (file("${project.projectDir}/src/main/idl").exists()) {
+def generateRestClient = file("${project.projectDir}/src/main/idl").exists()
+
+if (generateRestClient) {
 
   // Configure sources and javadoc jars for the rest client  library
   def restClientName = project.name + "-rest-client"
@@ -93,6 +95,15 @@ if (file("${project.projectDir}/src/main/idl").exists()) {
 
   artifacts {
     archives mainRestClientJar, restClientSourcesJar, restClientJavadocJar
+  }
+
+  publishing.publications {
+      restClient(MavenPublication) {
+        artifactId restClientName
+        artifacts = [mainRestClientJar, restClientSourcesJar, restClientJavadocJar]
+        pom pomAttributes
+        pom.withXml addRuntimeDependenciesToPom
+      }
   }
 }
 
@@ -119,6 +130,27 @@ if (rootProject.ext.publishToMaven || rootProject.ext.publishToNexus) {
         }.project(rootProject.pomAttributes)
         addFilter('') { artifact, file -> artifact.name == project.name
         }.project(rootProject.pomAttributes)
+      }
+    }
+  }
+}
+
+publishing.publications {
+    dataTemplate(MavenPublication) {
+      artifactId dataTemplateName
+      artifacts = [mainDataTemplateJar, dataTemplateSourcesJar, dataTemplateJavadocJar]
+      pom pomAttributes
+      pom.withXml addRuntimeDependenciesToPom
+    }
+}
+
+artifactory {
+  publish {
+    defaults {
+      if (generateRestClient) {
+        publications('mavenJava', 'restClient', 'dataTemplate')
+      } else {
+        publications('mavenJava', 'dataTemplate')
       }
     }
   }

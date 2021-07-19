@@ -27,17 +27,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.collect.ImmutableSet;
-import javax.inject.Inject;
-import javax.inject.Named;
-
 import com.linkedin.restli.common.ComplexResourceKey;
 import com.linkedin.restli.common.EmptyRecord;
 import com.linkedin.restli.common.HttpStatus;
-import com.linkedin.restli.common.PatchRequest;
 import com.linkedin.restli.server.CreateResponse;
 import com.linkedin.restli.server.UpdateResponse;
 import com.linkedin.restli.server.annotations.RestLiCollection;
 import com.linkedin.restli.server.resources.ComplexKeyResourceTemplate;
+
+import javax.inject.Inject;
+import javax.inject.Named;
 
 /**
  * Resource for handling flow configuration requests
@@ -46,19 +45,15 @@ import com.linkedin.restli.server.resources.ComplexKeyResourceTemplate;
 public class FlowConfigsResource extends ComplexKeyResourceTemplate<FlowId, EmptyRecord, FlowConfig> {
   private static final Logger LOG = LoggerFactory.getLogger(FlowConfigsResource.class);
 
-  public static final String INJECT_FLOW_CONFIG_RESOURCE_HANDLER = "flowConfigsResourceHandler";
-  public static final String INJECT_REQUESTER_SERVICE = "requesterService";
   public static final String INJECT_READY_TO_USE = "readToUse";
 
   private static final Set<String> ALLOWED_METADATA = ImmutableSet.of("delete.state.store");
 
   @Inject
-  @Named(INJECT_FLOW_CONFIG_RESOURCE_HANDLER)
   private FlowConfigsResourceHandler flowConfigsResourceHandler;
 
   // For getting who sends the request
   @Inject
-  @Named(INJECT_REQUESTER_SERVICE)
   private RequesterService requesterService;
 
   // For blocking use of this resource until it is ready
@@ -89,15 +84,19 @@ public class FlowConfigsResource extends ComplexKeyResourceTemplate<FlowId, Empt
    */
   @Override
   public CreateResponse create(FlowConfig flowConfig) {
-    List<ServiceRequester> requestorList = this.requesterService.findRequesters(this);
+    if (flowConfig.hasOwningGroup()) {
+      throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED, "Owning group property may "
+          + "not be set through flowconfigs API, use flowconfigsV2");
+    }
+
+    List<ServiceRequester> requesterList = this.requesterService.findRequesters(this);
 
     try {
-      String serialized = this.requesterService.serialize(requestorList);
+      String serialized = RequesterService.serialize(requesterList);
       flowConfig.getProperties().put(RequesterService.REQUESTER_LIST, serialized);
       LOG.info("Rest requester list is " + serialized);
     } catch (IOException e) {
-      throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED,
-          "cannot get who is the requester", e);
+      throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED, "cannot get who is the requester", e);
     }
     return this.flowConfigsResourceHandler.createFlowConfig(flowConfig);
   }
@@ -111,6 +110,15 @@ public class FlowConfigsResource extends ComplexKeyResourceTemplate<FlowId, Empt
    */
   @Override
   public UpdateResponse update(ComplexResourceKey<FlowId, EmptyRecord> key, FlowConfig flowConfig) {
+    if (flowConfig.hasOwningGroup()) {
+      throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED, "Owning group property may "
+          + "not be set through flowconfigs API, use flowconfigsV2");
+    }
+    if (flowConfig.getProperties().containsKey(RequesterService.REQUESTER_LIST)) {
+      throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED, RequesterService.REQUESTER_LIST + " property may "
+          + "not be set through flowconfigs API, use flowconfigsV2");
+    }
+    checkRequester(this.requesterService, get(key), this.requesterService.findRequesters(this));
     String flowGroup = key.getKey().getFlowGroup();
     String flowName = key.getKey().getFlowName();
     FlowId flowId = new FlowId().setFlowGroup(flowGroup).setFlowName(flowName);
@@ -124,10 +132,40 @@ public class FlowConfigsResource extends ComplexKeyResourceTemplate<FlowId, Empt
    */
   @Override
   public UpdateResponse delete(ComplexResourceKey<FlowId, EmptyRecord> key) {
+    checkRequester(this.requesterService, get(key), this.requesterService.findRequesters(this));
     String flowGroup = key.getKey().getFlowGroup();
     String flowName = key.getKey().getFlowName();
     FlowId flowId = new FlowId().setFlowGroup(flowGroup).setFlowName(flowName);
     return this.flowConfigsResourceHandler.deleteFlowConfig(flowId, getHeaders());
+  }
+
+  /**
+   * Check that all {@link ServiceRequester}s in this request are contained within the original service requester list
+   * when the flow was submitted. If they are not, throw a {@link FlowConfigLoggedException} with {@link HttpStatus#S_401_UNAUTHORIZED}.
+   * If there is a failure when deserializing the original requester list, throw a {@link FlowConfigLoggedException} with
+   * {@link HttpStatus#S_400_BAD_REQUEST}.
+   *
+   * @param requesterService the {@link RequesterService} used to verify the requester
+   * @param originalFlowConfig original flow config to find original requester
+   * @param requesterList list of requesters for this request
+   */
+  public static void checkRequester(
+      RequesterService requesterService, FlowConfig originalFlowConfig, List<ServiceRequester> requesterList) {
+    if (requesterService.isRequesterWhitelisted(requesterList)) {
+      return;
+    }
+
+    try {
+      String serializedOriginalRequesterList = originalFlowConfig.getProperties().get(RequesterService.REQUESTER_LIST);
+      if (serializedOriginalRequesterList != null) {
+        List<ServiceRequester> originalRequesterList = RequesterService.deserialize(serializedOriginalRequesterList);
+        if (!requesterService.isRequesterAllowed(originalRequesterList, requesterList)) {
+          throw new FlowConfigLoggedException(HttpStatus.S_401_UNAUTHORIZED, "Requester not allowed to make this request");
+        }
+      }
+    } catch (IOException e) {
+      throw new FlowConfigLoggedException(HttpStatus.S_400_BAD_REQUEST, "Failed to get original requester list", e);
+    }
   }
 
   private Properties getHeaders() {

@@ -31,6 +31,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.lang.exception.ExceptionUtils;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.LocalFileSystem;
+import org.apache.hadoop.fs.Path;
+import org.joda.time.DateTimeUtils;
+
+import com.google.common.base.Function;
+import com.google.common.base.Optional;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+
+import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
 import org.apache.gobblin.compaction.mapreduce.MRCompactionTaskFactory;
 import org.apache.gobblin.compaction.mapreduce.MRCompactor;
 import org.apache.gobblin.compaction.suite.CompactionSuite;
@@ -70,21 +86,6 @@ import org.apache.gobblin.util.request_allocation.RequestAllocatorConfig;
 import org.apache.gobblin.util.request_allocation.RequestAllocatorUtils;
 import org.apache.gobblin.util.request_allocation.ResourceEstimator;
 import org.apache.gobblin.util.request_allocation.ResourcePool;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.LocalFileSystem;
-import org.apache.hadoop.fs.Path;
-import org.joda.time.DateTimeUtils;
-
-import com.google.common.base.Function;
-import com.google.common.base.Optional;
-import com.google.common.base.Stopwatch;
-import com.google.common.collect.Iterators;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-
-import lombok.AllArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 
 import static org.apache.gobblin.util.HadoopUtils.getSourceFileSystem;
 
@@ -110,19 +111,23 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
   @Override
   public WorkUnitStream getWorkunitStream(SourceState state) {
     try {
-      initCompactionSource(state);
-
-      DatasetsFinder finder = DatasetUtils.instantiateDatasetFinder(state.getProperties(),
-              getSourceFileSystem(state),
-              DefaultFileSystemGlobFinder.class.getName());
+      fs = getSourceFileSystem(state);
+      DatasetsFinder<Dataset> finder = DatasetUtils.instantiateDatasetFinder(state.getProperties(),
+          fs, DefaultFileSystemGlobFinder.class.getName());
 
       List<Dataset> datasets = finder.findDatasets();
-      CompactionWorkUnitIterator workUnitIterator = new CompactionWorkUnitIterator ();
+      CompactionWorkUnitIterator workUnitIterator = new CompactionWorkUnitIterator();
+
+      if (datasets.size() == 0) {
+        return new BasicWorkUnitStream.Builder(workUnitIterator).build();
+      }
+
+      // initialize iff datasets are found
+      initCompactionSource(state);
 
       // Spawn a single thread to create work units
-      new Thread(new SingleWorkUnitGeneratorService (state, prioritize(datasets, state), workUnitIterator), "SingleWorkUnitGeneratorService").start();
-      return new BasicWorkUnitStream.Builder (workUnitIterator).build();
-
+      new Thread(new SingleWorkUnitGeneratorService(state, prioritize(datasets, state), workUnitIterator), "SingleWorkUnitGeneratorService").start();
+      return new BasicWorkUnitStream.Builder(workUnitIterator).build();
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -146,12 +151,12 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
       this.workUnitIterator = workUnitIterator;
     }
 
-    public void run () {
+    public void run() {
       try {
         Stopwatch stopwatch = Stopwatch.createStarted();
         int threads = this.state.getPropAsInt(CompactionVerifier.COMPACTION_VERIFICATION_THREADS, 5);
         long timeOutInMinute = this.state.getPropAsLong(CompactionVerifier.COMPACTION_VERIFICATION_TIMEOUT_MINUTES, 30);
-        long iterationCountLimit = this.state.getPropAsLong(CompactionVerifier.COMPACTION_VERIFICATION_ITERATION_COUNT_LIMIT, Integer.MAX_VALUE);
+        long iterationCountLimit = this.state.getPropAsLong(CompactionVerifier.COMPACTION_VERIFICATION_ITERATION_COUNT_LIMIT, 100);
         long iteration = 0;
         Map<String, String> failedReasonMap = null;
         while (datasets.size() > 0 && iteration++ < iterationCountLimit) {
@@ -200,7 +205,7 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
           for (Dataset dataset: datasets) {
             log.info ("{} is timed out and give up the verification, adding a failed task", dataset.datasetURN());
             // create failed task for these failed datasets
-            this.workUnitIterator.addWorkUnit (createWorkUnitForFailure(dataset, failedReasonMap.get(dataset.getUrn())));
+            this.workUnitIterator.addWorkUnit(createWorkUnitForFailure(dataset, failedReasonMap.get(dataset.getUrn())));
           }
         }
 
@@ -222,7 +227,6 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
    * happening inside {@link #initCompactionSource(SourceState)} is compulsory.
    */
   private void initCompactionSource(SourceState state) throws IOException {
-    fs = getSourceFileSystem(state);
     state.setProp(COMPACTION_INIT_TIME, DateTimeUtils.currentTimeMillis());
     suite = CompactionSuiteUtils.getCompactionSuiteFactory(state).createSuite(state);
 
@@ -312,11 +316,11 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
      * {@link VerifiedDataset} wraps original {@link Dataset} because if verification failed, we are able get original
      * datasets and restart the entire process of verification against those failed datasets.
      */
-    public VerifiedDataset call () throws DatasetVerificationException {
+    public VerifiedDataset call() throws DatasetVerificationException {
       try {
         VerifiedResult result = this.verify(dataset);
         if (result.allVerificationPassed) {
-          this.workUnitIterator.addWorkUnit (createWorkUnit(dataset));
+          this.workUnitIterator.addWorkUnit(createWorkUnit(dataset));
         }
         return new VerifiedDataset(dataset, result);
       } catch (Exception e) {
@@ -418,16 +422,18 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
     }
   }
 
-  protected WorkUnit createWorkUnit (Dataset dataset) throws IOException {
+  protected WorkUnit createWorkUnit(Dataset dataset) throws IOException {
     WorkUnit workUnit = new WorkUnit();
     TaskUtils.setTaskFactoryClass(workUnit, MRCompactionTaskFactory.class);
     suite.save(dataset, workUnit);
+    workUnit.setProp(ConfigurationKeys.DATASET_URN_KEY, dataset.getUrn());
     return workUnit;
   }
 
   protected WorkUnit createWorkUnitForFailure (Dataset dataset) throws IOException {
     WorkUnit workUnit = new FailedTask.FailedWorkUnit();
     TaskUtils.setTaskFactoryClass(workUnit, CompactionFailedTask.CompactionFailedTaskFactory.class);
+    workUnit.setProp(ConfigurationKeys.DATASET_URN_KEY, dataset.getUrn());
     suite.save(dataset, workUnit);
     return workUnit;
   }
@@ -436,6 +442,7 @@ public class CompactionSource implements WorkUnitStreamSource<String, String> {
     WorkUnit workUnit = new FailedTask.FailedWorkUnit();
     workUnit.setProp(CompactionVerifier.COMPACTION_VERIFICATION_FAIL_REASON, reason);
     TaskUtils.setTaskFactoryClass(workUnit, CompactionFailedTask.CompactionFailedTaskFactory.class);
+    workUnit.setProp(ConfigurationKeys.DATASET_URN_KEY, dataset.getUrn());
     suite.save(dataset, workUnit);
     return workUnit;
   }

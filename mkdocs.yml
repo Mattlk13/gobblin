@@ -1,8 +1,8 @@
-site_name: Gobblin Documentation
-site_description: Documentation for Gobblin, a universal data ingestion framework for Hadoop
-site_author: Abhishek Tiwari, Aditya Sharma, Chavdar Botev, Issac Buenrostro, Min Tu, Narasimha Veeramreedy, Pradhan Cadabam, Raul Agepati, Sahil Takiar, Shirshanka Das, Yinan Li, Ying Dai, Ziyang Liu
+site_name: Apache Gobblin
+site_description: Documentation for Gobblin, a universal data integration framework
+site_author: Apache Software Foundation
 
-repo_url: https://github.com/apache/incubator-gobblin
+repo_url: https://github.com/apache/gobblin
 repo_name: Gobblin
 
 docs_dir: gobblin-docs
@@ -11,6 +11,8 @@ theme: readthedocs
 
 extra_css: [css/extra.css]
 extra_javascript: [js/extra.js]
+
+site_dir: docs
 
 pages:
     - Home: index.md
@@ -99,11 +101,11 @@ pages:
         - Documentation Architecture: developer-guide/Documentation-Architecture.md
         - Contributing: developer-guide/Contributing.md
         - Gobblin Modules: developer-guide/GobblinModules.md
+        - High Level Consumer: developer-guide/HighLevelConsumer.md
     - Project:
         - Feature List: project/Feature-List.md
-        - Contributors and Team: project/Team.md
+        - Contributors and Team: /people
         - Talks and Tech Blog Posts: project/Talks-and-Tech-Blogs.md
-        - News and Roadmap: project/News.md
         - Posts: project/Posts.md
     - Miscellaneous:
         - Camus to Gobblin Migration: miscellaneous/Camus-to-Gobblin-Migration.md

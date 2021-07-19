@@ -37,14 +37,13 @@ import com.typesafe.config.ConfigValueFactory;
 import javax.annotation.Nullable;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
+import org.apache.gobblin.runtime.api.FlowSpec;
 import org.apache.gobblin.runtime.api.TopologySpec;
 import org.apache.gobblin.service.ExecutionStatus;
-import org.apache.gobblin.service.FlowConfigResourceLocalHandler;
 import org.apache.gobblin.service.FlowId;
 import org.apache.gobblin.service.modules.flowgraph.Dag;
 import org.apache.gobblin.service.modules.spec.JobExecutionPlan;
 import org.apache.gobblin.service.monitoring.JobStatusRetriever;
-import org.apache.gobblin.service.monitoring.KafkaJobStatusMonitor;
 import org.apache.gobblin.testing.AssertWithBackoff;
 import org.apache.gobblin.util.ConfigUtils;
 
@@ -70,9 +69,13 @@ public class DagManagerFlowTest {
 
   @Test
   void testAddDeleteSpec() throws Exception {
-    Dag<JobExecutionPlan> dag1 = DagManagerTest.buildDag("0", 123456780L, "FINISH_RUNNING", 1);
-    Dag<JobExecutionPlan> dag2 = DagManagerTest.buildDag("1", 123456781L, "FINISH_RUNNING", 1);
-    Dag<JobExecutionPlan> dag3 = DagManagerTest.buildDag("2", 123456782L, "FINISH_RUNNING", 1);
+    Long flowExecutionId1 = System.currentTimeMillis();
+    Long flowExecutionId2 = flowExecutionId1 + 1;
+    Long flowExecutionId3 = flowExecutionId1 + 2;
+
+    Dag<JobExecutionPlan> dag1 = DagManagerTest.buildDag("0", flowExecutionId1, "FINISH_RUNNING", 1);
+    Dag<JobExecutionPlan> dag2 = DagManagerTest.buildDag("1", flowExecutionId2, "FINISH_RUNNING", 1);
+    Dag<JobExecutionPlan> dag3 = DagManagerTest.buildDag("2", flowExecutionId3, "FINISH_RUNNING", 1);
 
     String dagId1 = DagManagerUtils.generateDagId(dag1);
     String dagId2 = DagManagerUtils.generateDagId(dag2);
@@ -83,16 +86,16 @@ public class DagManagerFlowTest {
     int queue3 = DagManagerUtils.getDagQueueId(dag3, dagNumThreads);
 
     when(this.dagManager.getJobStatusRetriever().getLatestExecutionIdsForFlow(eq("flow0"), eq("group0"), anyInt()))
-        .thenReturn(Collections.singletonList(123456780L));
+        .thenReturn(Collections.singletonList(flowExecutionId1));
     when(this.dagManager.getJobStatusRetriever().getLatestExecutionIdsForFlow(eq("flow1"), eq("group1"), anyInt()))
-        .thenReturn(Collections.singletonList(123456781L));
+        .thenReturn(Collections.singletonList(flowExecutionId2));
     when(this.dagManager.getJobStatusRetriever().getLatestExecutionIdsForFlow(eq("flow2"), eq("group2"), anyInt()))
-        .thenReturn(Collections.singletonList(123456782L));
+        .thenReturn(Collections.singletonList(flowExecutionId3));
 
     // mock add spec
-    dagManager.addDag(dag1, true);
-    dagManager.addDag(dag2, true);
-    dagManager.addDag(dag3, true);
+    dagManager.addDag(dag1, true, true);
+    dagManager.addDag(dag2, true, true);
+    dagManager.addDag(dag3, true, true);
 
     // check existence of dag in dagToJobs map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -102,31 +105,31 @@ public class DagManagerFlowTest {
     AssertWithBackoff.create().maxSleepMs(1000).backoffFactor(1).
         assertTrue(input -> dagManager.dagManagerThreads[queue3].dagToJobs.containsKey(dagId3), ERROR_MESSAGE);
 
-    // mock delete spec
-    dagManager.stopDag(FlowConfigResourceLocalHandler.FlowUriUtils.createFlowSpecUri(new FlowId().setFlowGroup("group0").setFlowName("flow0")));
-    dagManager.stopDag(FlowConfigResourceLocalHandler.FlowUriUtils.createFlowSpecUri(new FlowId().setFlowGroup("group1").setFlowName("flow1")));
-    dagManager.stopDag(FlowConfigResourceLocalHandler.FlowUriUtils.createFlowSpecUri(new FlowId().setFlowGroup("group2").setFlowName("flow2")));
+    // mock cancel job
+    dagManager.stopDag(FlowSpec.Utils.createFlowSpecUri(new FlowId().setFlowGroup("group0").setFlowName("flow0")));
+    dagManager.stopDag(FlowSpec.Utils.createFlowSpecUri(new FlowId().setFlowGroup("group1").setFlowName("flow1")));
+    dagManager.stopDag(FlowSpec.Utils.createFlowSpecUri(new FlowId().setFlowGroup("group2").setFlowName("flow2")));
 
-    // verify deleteSpec() of specProducer is called once
-    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new DeletePredicate(dag1), ERROR_MESSAGE);
-    AssertWithBackoff.create().maxSleepMs(1000).backoffFactor(1).assertTrue(new DeletePredicate(dag2), ERROR_MESSAGE);
-    AssertWithBackoff.create().maxSleepMs(1000).backoffFactor(1).assertTrue(new DeletePredicate(dag3), ERROR_MESSAGE);
+    // verify cancelJob() of specProducer is called once
+    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new CancelPredicate(dag1), ERROR_MESSAGE);
+    AssertWithBackoff.create().maxSleepMs(1000).backoffFactor(1).assertTrue(new CancelPredicate(dag2), ERROR_MESSAGE);
+    AssertWithBackoff.create().maxSleepMs(1000).backoffFactor(1).assertTrue(new CancelPredicate(dag3), ERROR_MESSAGE);
 
     // mock flow cancellation tracking event
-    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow0", "group0", 123456780L,
+    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow0", "group0", flowExecutionId1,
         "group0", "job0", String.valueOf(ExecutionStatus.CANCELLED)))
         .when(dagManager.getJobStatusRetriever()).getJobStatusesForFlowExecution("flow0", "group0",
-        123456780L, "job0", "group0");
+        flowExecutionId1, "job0", "group0");
 
-    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow1", "group1", 123456781L,
+    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow1", "group1", flowExecutionId2,
         "group1", "job0", String.valueOf(ExecutionStatus.CANCELLED)))
         .when(dagManager.getJobStatusRetriever()).getJobStatusesForFlowExecution("flow1", "group1",
-        123456781L, "job0", "group1");
+        flowExecutionId2, "job0", "group1");
 
-    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow2", "group2", 123456782L,
+    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow2", "group2", flowExecutionId3,
         "group2", "job0", String.valueOf(ExecutionStatus.CANCELLED)))
         .when(dagManager.getJobStatusRetriever()).getJobStatusesForFlowExecution("flow2", "group2",
-        123456782L, "job0", "group2");
+        flowExecutionId3, "job0", "group2");
 
     // check removal of dag in dagToJobs map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -148,7 +151,7 @@ public class DagManagerFlowTest {
         .thenReturn(Collections.singletonList(flowExecutionId));
 
     // mock add spec
-    dagManager.addDag(dag, true);
+    dagManager.addDag(dag, true, true);
 
     // check existence of dag in dagToJobs map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -159,12 +162,12 @@ public class DagManagerFlowTest {
         assertTrue(input -> dagManager.dagManagerThreads[queue].dagToSLA.containsKey(dagId), ERROR_MESSAGE);
 
     // check the SLA value
-    Assert.assertEquals(dagManager.dagManagerThreads[queue].dagToSLA.get(dagId).longValue(), DagManagerUtils.NO_SLA);
+    Assert.assertEquals(dagManager.dagManagerThreads[queue].dagToSLA.get(dagId).longValue(), DagManagerUtils.DEFAULT_FLOW_SLA_MILLIS);
 
-    // verify deleteSpec() of the specProducer is not called once
+    // verify cancelJob() of the specProducer is not called once
     // which means job cancellation was triggered
     try {
-      AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new DeletePredicate(dag), ERROR_MESSAGE);
+      AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new CancelPredicate(dag), ERROR_MESSAGE);
     } catch (TimeoutException e) {
       AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
           assertTrue(input -> dagManager.dagManagerThreads[queue].dagToJobs.containsKey(dagId), ERROR_MESSAGE);
@@ -192,7 +195,7 @@ public class DagManagerFlowTest {
     dag.getStartNodes().get(0).getValue().getJobSpec().setConfig(jobConfig);
 
     // mock add spec
-    dagManager.addDag(dag, true);
+    dagManager.addDag(dag, true, true);
 
     // check existence of dag in dagToSLA map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -205,9 +208,9 @@ public class DagManagerFlowTest {
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
         assertTrue(input -> dagManager.dagManagerThreads[queue].dagToJobs.containsKey(dagId), ERROR_MESSAGE);
 
-    // verify deleteSpec() of specProducer is called once
+    // verify cancelJob() of specProducer is called once
     // which means job cancellation was triggered
-    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new DeletePredicate(dag), ERROR_MESSAGE);
+    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new CancelPredicate(dag), ERROR_MESSAGE);
 
     // check removal of dag from dagToSLA map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -216,12 +219,10 @@ public class DagManagerFlowTest {
 
   @Test()
   void testOrphanFlowKill() throws Exception {
-    Dag<JobExecutionPlan> dag = DagManagerTest.buildDag("6", 234567891L, "FINISH_RUNNING", 1);
+    Long flowExecutionId = System.currentTimeMillis() - TimeUnit.SECONDS.toMillis(10);
+    Dag<JobExecutionPlan> dag = DagManagerTest.buildDag("6", flowExecutionId, "FINISH_RUNNING", 1);
     String dagId = DagManagerUtils.generateDagId(dag);
     int queue = DagManagerUtils.getDagQueueId(dag, dagNumThreads);
-
-    when(this.dagManager.getJobStatusRetriever().getLatestExecutionIdsForFlow(eq("flow4"), eq("group4"), anyInt()))
-        .thenReturn(Collections.singletonList(234567891L));
 
     // change config to set a small sla
     Config jobConfig = dag.getStartNodes().get(0).getValue().getJobSpec().getConfig();
@@ -231,24 +232,24 @@ public class DagManagerFlowTest {
     dag.getStartNodes().get(0).getValue().getJobSpec().setConfig(jobConfig);
 
     // mock add spec
-    dagManager.addDag(dag, true);
+    dagManager.addDag(dag, true, true);
 
     // check existence of dag in dagToSLA map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
         assertTrue(input -> dagManager.dagManagerThreads[queue].dagToSLA.containsKey(dagId), ERROR_MESSAGE);
 
-    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow6", "group6", 234567891L,
-        "group0", "job0", String.valueOf(ExecutionStatus.ORCHESTRATED)))
+    Mockito.doReturn(DagManagerTest.getMockJobStatus("flow6", "group6", flowExecutionId,
+        "group6", "job0", String.valueOf(ExecutionStatus.ORCHESTRATED)))
         .when(dagManager.getJobStatusRetriever()).getJobStatusesForFlowExecution("flow6", "group6",
-        234567891L, "job0", "group6");
+        flowExecutionId, "job0", "group6");
 
     // check existence of dag in dagToJobs map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
         assertTrue(input -> dagManager.dagManagerThreads[queue].dagToJobs.containsKey(dagId), ERROR_MESSAGE);
 
-    // verify deleteSpec() of specProducer is called once
+    // verify cancelJob() of specProducer is called once
     // which means job cancellation was triggered
-    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new DeletePredicate(dag), ERROR_MESSAGE);
+    AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).assertTrue(new CancelPredicate(dag), ERROR_MESSAGE);
 
     // check removal of dag from dagToSLA map
     AssertWithBackoff.create().maxSleepMs(5000).backoffFactor(1).
@@ -258,7 +259,7 @@ public class DagManagerFlowTest {
   @Test
   void slaConfigCheck() throws Exception {
     Dag<JobExecutionPlan> dag = DagManagerTest.buildDag("5", 123456783L, "FINISH_RUNNING", 1);
-    Assert.assertEquals(DagManagerUtils.getFlowSLA(dag.getStartNodes().get(0)), -1L);
+    Assert.assertEquals(DagManagerUtils.getFlowSLA(dag.getStartNodes().get(0)), DagManagerUtils.DEFAULT_FLOW_SLA_MILLIS);
 
     Config jobConfig = dag.getStartNodes().get(0).getValue().getJobSpec().getConfig();
     jobConfig = jobConfig
@@ -275,16 +276,16 @@ public class DagManagerFlowTest {
   }
 }
 
-class DeletePredicate implements Predicate<Void> {
+class CancelPredicate implements Predicate<Void> {
   private final Dag<JobExecutionPlan> dag;
-  public DeletePredicate(Dag<JobExecutionPlan> dag) {
+  public CancelPredicate(Dag<JobExecutionPlan> dag) {
     this.dag = dag;
   }
 
   @Override
   public boolean apply(@Nullable Void input) {
     try {
-      verify(dag.getNodes().get(0).getValue().getSpecExecutor().getProducer().get()).deleteSpec(any(), any());
+      verify(dag.getNodes().get(0).getValue().getSpecExecutor().getProducer().get()).cancelJob(any(), any());
     } catch (Throwable e) {
       return false;
     }
@@ -295,20 +296,14 @@ class DeletePredicate implements Predicate<Void> {
 class MockedDagManager extends DagManager {
 
   public MockedDagManager(Config config, boolean instrumentationEnabled) {
-    super(config, instrumentationEnabled);
+    super(config, createJobStatusRetriever(), instrumentationEnabled);
   }
 
-  @Override
-  JobStatusRetriever createJobStatusRetriever(Config config) {
+  private static JobStatusRetriever createJobStatusRetriever() {
     JobStatusRetriever mockedJbStatusRetriever = Mockito.mock(JobStatusRetriever.class);
     Mockito.doReturn(Collections.emptyIterator()).when(mockedJbStatusRetriever).
         getJobStatusesForFlowExecution(anyString(), anyString(), anyLong(), anyString(), anyString());
     return  mockedJbStatusRetriever;
-  }
-
-  @Override
-  KafkaJobStatusMonitor createJobStatusMonitor(Config config) {
-    return null;
   }
 
   @Override

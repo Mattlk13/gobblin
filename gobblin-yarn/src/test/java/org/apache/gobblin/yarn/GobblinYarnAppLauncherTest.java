@@ -25,12 +25,15 @@ import java.io.PrintWriter;
 import java.lang.reflect.Field;
 import java.net.URL;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeoutException;
 
+import org.apache.avro.Schema;
+import org.apache.commons.io.FileUtils;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.test.TestingServer;
 import org.apache.hadoop.fs.FileSystem;
@@ -46,6 +49,8 @@ import org.apache.helix.HelixManagerFactory;
 import org.apache.helix.InstanceType;
 import org.apache.helix.model.Message;
 import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.Assert;
@@ -54,6 +59,7 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Charsets;
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.eventbus.EventBus;
@@ -72,6 +78,8 @@ import org.apache.gobblin.cluster.TestHelper;
 import org.apache.gobblin.cluster.TestShutdownMessageHandlerFactory;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.DynamicConfigGenerator;
+import org.apache.gobblin.metrics.kafka.KafkaAvroSchemaRegistry;
+import org.apache.gobblin.metrics.kafka.KafkaSchemaRegistry;
 import org.apache.gobblin.runtime.app.ServiceBasedAppLauncher;
 import org.apache.gobblin.testing.AssertWithBackoff;
 
@@ -209,7 +217,7 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
 
   @Test
   public void testBuildApplicationMasterCommand() {
-    String command = this.gobblinYarnAppLauncher.buildApplicationMasterCommand(64);
+    String command = this.gobblinYarnAppLauncher.buildApplicationMasterCommand("application_1234_3456", 64);
 
     // 41 is from 64 * 0.8 - 10
     Assert.assertTrue(command.contains("-Xmx41"));
@@ -248,8 +256,12 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
    * application successfully. This works fine on local machine though. So disabling this and the test
    * below that depends on it on Travis-CI.
    */
-  @Test(enabled=false, groups = { "disabledOnTravis" }, dependsOnMethods = "testCreateHelixCluster")
+  @Test(enabled=false, groups = { "disabledOnCI" }, dependsOnMethods = "testCreateHelixCluster")
   public void testSetupAndSubmitApplication() throws Exception {
+    HelixUtils.createGobblinHelixCluster(
+        this.config.getString(GobblinClusterConfigurationKeys.ZK_CONNECTION_STRING_KEY),
+        this.config.getString(GobblinClusterConfigurationKeys.HELIX_CLUSTER_NAME_KEY));
+
     this.gobblinYarnAppLauncher.startYarnClient();
     this.applicationId = this.gobblinYarnAppLauncher.setupAndSubmitApplication();
 
@@ -273,7 +285,7 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
         YarnApplicationState.RUNNING, "Application may have aborted");
   }
 
-  @Test(enabled=false, groups = { "disabledOnTravis" }, dependsOnMethods = "testSetupAndSubmitApplication")
+  @Test(enabled=false, groups = { "disabledOnCI" }, dependsOnMethods = "testSetupAndSubmitApplication")
   public void testGetReconnectableApplicationId() throws Exception {
     Assert.assertEquals(this.gobblinYarnAppLauncher.getReconnectableApplicationId().get(), this.applicationId);
     this.yarnClient.killApplication(this.applicationId);
@@ -422,6 +434,45 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
     Mockito.verify(mockMultiManager, times(1)).cleanUpJobs();
   }
 
+  @Test
+  public void testOutputConfig() throws IOException {
+    File tmpTestDir = com.google.common.io.Files.createTempDir();
+
+    try {
+      Path outputPath = Paths.get(tmpTestDir.toString(), "application.conf");
+      Config config = ConfigFactory.empty()
+          .withValue(ConfigurationKeys.FS_URI_KEY, ConfigValueFactory.fromAnyRef("file:///"))
+          .withValue(GobblinYarnAppLauncher.GOBBLIN_YARN_CONFIG_OUTPUT_PATH,
+              ConfigValueFactory.fromAnyRef(outputPath.toString()));
+
+      GobblinYarnAppLauncher.outputConfigToFile(config);
+
+      String configString = com.google.common.io.Files.toString(outputPath.toFile(), Charsets.UTF_8);
+      Assert.assertTrue(configString.contains("fs"));
+    } finally {
+      FileUtils.deleteDirectory(tmpTestDir);
+    }
+  }
+
+  @Test
+  public void testAddMetricReportingDynamicConfig()
+      throws IOException {
+    KafkaAvroSchemaRegistry schemaRegistry = Mockito.mock(KafkaAvroSchemaRegistry.class);
+    Mockito.when(schemaRegistry.register(Mockito.any(Schema.class), Mockito.anyString())).thenAnswer(new Answer<String>() {
+      @Override
+      public String answer(InvocationOnMock invocation) {
+        return "testId";
+      }
+    });
+    Config config = ConfigFactory.empty().withValue(ConfigurationKeys.METRICS_KAFKA_TOPIC_EVENTS, ConfigValueFactory.fromAnyRef("topic"))
+        .withValue(ConfigurationKeys.METRICS_REPORTING_KAFKA_ENABLED_KEY, ConfigValueFactory.fromAnyRef(true))
+        .withValue(ConfigurationKeys.METRICS_REPORTING_KAFKA_USE_SCHEMA_REGISTRY, ConfigValueFactory.fromAnyRef(true))
+        .withValue(KafkaSchemaRegistry.KAFKA_SCHEMA_REGISTRY_URL, ConfigValueFactory.fromAnyRef("http://testSchemaReg:0000"));
+    config = GobblinYarnAppLauncher.addMetricReportingDynamicConfig(config, schemaRegistry);
+    Assert.assertEquals(config.getString(ConfigurationKeys.METRICS_REPORTING_EVENTS_KAFKA_AVRO_SCHEMA_ID), "testId");
+    Assert.assertFalse(config.hasPath(ConfigurationKeys.METRICS_REPORTING_METRICS_KAFKA_AVRO_SCHEMA_ID));
+  }
+
   /**
    * An application master for accessing protected fields in {@link GobblinApplicationMaster}
    * for testing.
@@ -430,7 +481,7 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
     public TestApplicationMaster(String applicationName, ContainerId containerId, Config config,
         YarnConfiguration yarnConfiguration)
         throws Exception {
-      super(applicationName, containerId, config, yarnConfiguration);
+      super(applicationName, containerId.getApplicationAttemptId().getApplicationId().toString(), containerId, config, yarnConfiguration);
     }
 
     @Override
@@ -476,7 +527,7 @@ public class GobblinYarnAppLauncherTest implements HelixMessageTestBase {
   private static class TestYarnService extends YarnService {
     public TestYarnService(Config config, String applicationName, String applicationId, YarnConfiguration yarnConfiguration,
         FileSystem fs, EventBus eventBus) throws Exception {
-      super(config, applicationName, applicationId, yarnConfiguration, fs, eventBus);
+      super(config, applicationName, applicationId, yarnConfiguration, fs, eventBus, null);
     }
 
     @Override

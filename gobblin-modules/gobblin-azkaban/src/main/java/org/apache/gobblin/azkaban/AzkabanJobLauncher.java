@@ -19,10 +19,10 @@ package org.apache.gobblin.azkaban;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
@@ -30,6 +30,25 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.Credentials;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+
+import com.google.common.base.Optional;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
+import com.google.common.base.Strings;
+import com.google.common.collect.Lists;
+import com.google.common.io.Closer;
+import com.typesafe.config.Config;
+import com.typesafe.config.ConfigValue;
+
+import azkaban.jobExecutor.AbstractJob;
+import javax.annotation.Nullable;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.DynamicConfigGenerator;
@@ -48,30 +67,13 @@ import org.apache.gobblin.runtime.app.ServiceBasedAppLauncher;
 import org.apache.gobblin.runtime.listeners.CompositeJobListener;
 import org.apache.gobblin.runtime.listeners.EmailNotificationJobListener;
 import org.apache.gobblin.runtime.listeners.JobListener;
+import org.apache.gobblin.runtime.services.MetricsReportingService;
 import org.apache.gobblin.util.ClassAliasResolver;
 import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.util.HadoopUtils;
+import org.apache.gobblin.util.PropertiesUtils;
 import org.apache.gobblin.util.TimeRangeChecker;
 import org.apache.gobblin.util.hadoop.TokenUtils;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.security.Credentials;
-import org.apache.log4j.Level;
-import org.apache.log4j.Logger;
-import org.joda.time.DateTime;
-import org.joda.time.DateTimeZone;
-
-import com.google.common.base.Optional;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Splitter;
-import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
-import com.google.common.io.Closer;
-import com.typesafe.config.Config;
-import com.typesafe.config.ConfigValue;
-
-import azkaban.jobExecutor.AbstractJob;
-import javax.annotation.Nullable;
 
 import static org.apache.gobblin.runtime.AbstractJobLauncher.resolveGobblinJobTemplateIfNecessary;
 import static org.apache.hadoop.security.UserGroupInformation.HADOOP_TOKEN_FILE_LOCATION;
@@ -87,9 +89,9 @@ import static org.apache.hadoop.security.UserGroupInformation.HADOOP_TOKEN_FILE_
  * </p>
  *
  * <p>
- *   If the Azkaban job type is not contained in {@link #JOB_TYPES_WITH_AUTOMATIC_TOKEN}, the launcher assumes that
- *   the job does not get authentication tokens from Azkaban and it will negotiate them itself.
- *   See {@link TokenUtils#getHadoopTokens} for more information.
+ *   The launcher will use Hadoop token provided in environment variable
+ *   {@link org.apache.hadoop.security.UserGroupInformation#HADOOP_TOKEN_FILE_LOCATION}.
+ *   If it is missing, the launcher will get a token using {@link TokenUtils#getHadoopTokens}.
  * </p>
  *
  * @author Yinan Li
@@ -109,11 +111,8 @@ public class AzkabanJobLauncher extends AbstractJob implements ApplicationLaunch
   private static final String AZKABAN_GOBBLIN_JOB_SLA_IN_SECONDS = "gobblin.azkaban.SLAInSeconds";
   private static final String DEFAULT_AZKABAN_GOBBLIN_JOB_SLA_IN_SECONDS = "-1"; // No SLA.
 
-  private static final String HADOOP_JAVA_JOB = "hadoopJava";
-  private static final String JAVA_JOB = "java";
-  private static final String GOBBLIN_JOB = "gobblin";
-  private static final Set<String> JOB_TYPES_WITH_AUTOMATIC_TOKEN =
-      Sets.newHashSet(HADOOP_JAVA_JOB, JAVA_JOB, GOBBLIN_JOB);
+  public static final String GOBBLIN_AZKABAN_INITIALIZE_HADOOP_TOKENS = "gobblin.azkaban.initializeHadoopTokens";
+  public static final String DEFAULT_GOBBLIN_AZKABAN_INITIALIZE_HADOOP_TOKENS = "true";
 
   private final Closer closer = Closer.create();
   private final JobLauncher jobLauncher;
@@ -172,26 +171,24 @@ public class AzkabanJobLauncher extends AbstractJob implements ApplicationLaunch
     this.props
         .setProperty(ConfigurationKeys.JOB_TRACKING_URL_KEY, Strings.nullToEmpty(conf.get(AZKABAN_LINK_JOBEXEC_URL)));
 
-    if (props.containsKey(JOB_TYPE) && JOB_TYPES_WITH_AUTOMATIC_TOKEN.contains(props.getProperty(JOB_TYPE))) {
-      // Necessary for compatibility with Azkaban's hadoopJava job type
-      // http://azkaban.github.io/azkaban/docs/2.5/#hadoopjava-type
-      LOG.info(
-          "Job type " + props.getProperty(JOB_TYPE) + " provides Hadoop tokens automatically. Using provided tokens.");
+    if (Boolean.parseBoolean(this.props.getProperty(GOBBLIN_AZKABAN_INITIALIZE_HADOOP_TOKENS,
+        DEFAULT_GOBBLIN_AZKABAN_INITIALIZE_HADOOP_TOKENS))) {
       if (System.getenv(HADOOP_TOKEN_FILE_LOCATION) != null) {
+        LOG.info("Job type " + props.getProperty(JOB_TYPE) + " provided Hadoop token in the environment variable " + HADOOP_TOKEN_FILE_LOCATION);
         this.props.setProperty(MAPREDUCE_JOB_CREDENTIALS_BINARY, System.getenv(HADOOP_TOKEN_FILE_LOCATION));
+      } else {
+        // see javadoc for more information
+        LOG.info(
+            "Job type " + props.getProperty(JOB_TYPE) + " did not provide Hadoop token in the environment variable " + HADOOP_TOKEN_FILE_LOCATION + ". Negotiating Hadoop tokens.");
+
+        File tokenFile = Files.createTempFile("mr-azkaban", ".token").toFile();
+        TokenUtils.getHadoopTokens(new State(props), Optional.of(tokenFile), new Credentials());
+
+        System.setProperty(HADOOP_TOKEN_FILE_LOCATION, tokenFile.getAbsolutePath());
+        System.setProperty(MAPREDUCE_JOB_CREDENTIALS_BINARY, tokenFile.getAbsolutePath());
+        this.props.setProperty(MAPREDUCE_JOB_CREDENTIALS_BINARY, tokenFile.getAbsolutePath());
+        this.props.setProperty("env." + HADOOP_TOKEN_FILE_LOCATION, tokenFile.getAbsolutePath());
       }
-    } else {
-      // see javadoc for more information
-      LOG.info(String.format("Job type %s does not provide Hadoop tokens. Negotiating Hadoop tokens.",
-          props.getProperty(JOB_TYPE)));
-
-      File tokenFile = File.createTempFile("mr-azkaban", ".token");
-      TokenUtils.getHadoopTokens(new State(props), Optional.of(tokenFile), new Credentials());
-
-      System.setProperty(HADOOP_TOKEN_FILE_LOCATION, tokenFile.getAbsolutePath());
-      System.setProperty(MAPREDUCE_JOB_CREDENTIALS_BINARY, tokenFile.getAbsolutePath());
-      this.props.setProperty(MAPREDUCE_JOB_CREDENTIALS_BINARY, tokenFile.getAbsolutePath());
-      this.props.setProperty("env." + HADOOP_TOKEN_FILE_LOCATION, tokenFile.getAbsolutePath());
     }
 
     Properties jobProps = this.props;
@@ -222,6 +219,16 @@ public class AzkabanJobLauncher extends AbstractJob implements ApplicationLaunch
 
     // Since Java classes cannot extend multiple classes and Azkaban jobs must extend AbstractJob, we must use composition
     // verses extending ServiceBasedAppLauncher
+    boolean isMetricReportingFailureFatal = PropertiesUtils
+        .getPropAsBoolean(jobProps, ConfigurationKeys.GOBBLIN_JOB_METRIC_REPORTING_FAILURE_FATAL,
+            Boolean.toString(ConfigurationKeys.DEFAULT_GOBBLIN_JOB_METRIC_REPORTING_FAILURE_FATAL));
+    boolean isEventReportingFailureFatal = PropertiesUtils
+        .getPropAsBoolean(jobProps, ConfigurationKeys.GOBBLIN_JOB_EVENT_REPORTING_FAILURE_FATAL,
+            Boolean.toString(ConfigurationKeys.DEFAULT_GOBBLIN_JOB_EVENT_REPORTING_FAILURE_FATAL));
+
+    jobProps.setProperty(MetricsReportingService.METRICS_REPORTING_FAILURE_FATAL_KEY, Boolean.toString(isMetricReportingFailureFatal));
+    jobProps.setProperty(MetricsReportingService.EVENT_REPORTING_FAILURE_FATAL_KEY, Boolean.toString(isEventReportingFailureFatal));
+
     this.applicationLauncher =
         this.closer.register(new ServiceBasedAppLauncher(jobProps, "Azkaban-" + UUID.randomUUID()));
   }

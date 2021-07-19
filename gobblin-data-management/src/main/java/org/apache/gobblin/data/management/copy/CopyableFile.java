@@ -17,32 +17,29 @@
 
 package org.apache.gobblin.data.management.copy;
 
-import org.apache.gobblin.data.management.partition.File;
-import org.apache.gobblin.data.management.copy.PreserveAttributes.Option;
-import org.apache.gobblin.dataset.DatasetConstants;
-import org.apache.gobblin.dataset.DatasetDescriptor;
-import org.apache.gobblin.dataset.Descriptor;
-import org.apache.gobblin.util.PathUtils;
-import org.apache.gobblin.util.guid.Guid;
-
+import com.google.common.base.Optional;
+import com.google.common.collect.Lists;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-
 import lombok.AccessLevel;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-
+import org.apache.gobblin.data.management.copy.PreserveAttributes.Option;
+import org.apache.gobblin.data.management.partition.File;
+import org.apache.gobblin.dataset.DatasetConstants;
+import org.apache.gobblin.dataset.DatasetDescriptor;
+import org.apache.gobblin.dataset.Descriptor;
+import org.apache.gobblin.util.ConfigUtils;
+import org.apache.gobblin.util.PathUtils;
+import org.apache.gobblin.util.guid.Guid;
 import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
-
-import com.google.common.base.Optional;
-import com.google.common.collect.Lists;
 
 
 /**
@@ -54,6 +51,8 @@ import com.google.common.collect.Lists;
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
 @EqualsAndHashCode(callSuper = true)
 public class CopyableFile extends CopyEntity implements File {
+  private static final byte[] EMPTY_CHECKSUM = new byte[0];
+
   /**
    * The source data the file belongs to. For now, since it's only used before copying, set it to be
    * transient so that it won't be serialized, avoid unnecessary data transfer
@@ -136,13 +135,14 @@ public class CopyableFile extends CopyEntity implements File {
 
     Path fullSourcePath = Path.getPathWithoutSchemeAndAuthority(origin.getPath());
     String sourceDatasetName = isDir ? fullSourcePath.toString() : fullSourcePath.getParent().toString();
-    DatasetDescriptor sourceDataset = new DatasetDescriptor(originFs.getScheme(), sourceDatasetName);
+    DatasetDescriptor sourceDataset = new DatasetDescriptor(originFs.getScheme(), originFs.getUri(), sourceDatasetName);
     sourceDataset.addMetadata(DatasetConstants.FS_URI, originFs.getUri().toString());
     sourceData = sourceDataset;
 
     Path fullDestinationPath = Path.getPathWithoutSchemeAndAuthority(destination);
     String destinationDatasetName = isDir ? fullDestinationPath.toString() : fullDestinationPath.getParent().toString();
-    DatasetDescriptor destinationDataset = new DatasetDescriptor(targetFs.getScheme(), destinationDatasetName);
+    DatasetDescriptor destinationDataset = new DatasetDescriptor(targetFs.getScheme(), targetFs.getUri(),
+            destinationDatasetName);
     destinationDataset.addMetadata(DatasetConstants.FS_URI, targetFs.getUri().toString());
     destinationData = destinationDataset;
   }
@@ -250,8 +250,12 @@ public class CopyableFile extends CopyEntity implements File {
             this.configuration.getTargetFs(), this.destination);
       }
       if (this.checksum == null) {
-        FileChecksum checksumTmp = this.origin.isDirectory() ? null : this.originFs.getFileChecksum(this.origin.getPath());
-        this.checksum = checksumTmp == null ? new byte[0] : checksumTmp.getBytes();
+        if (ConfigUtils.getBoolean(this.configuration.getConfig(), "copy.skipChecksum", true)) {
+          this.checksum = EMPTY_CHECKSUM;
+        } else {
+          FileChecksum checksumTmp = this.origin.isDirectory() ? null : this.originFs.getFileChecksum(this.origin.getPath());
+          this.checksum = checksumTmp == null ? EMPTY_CHECKSUM : checksumTmp.getBytes();
+        }
       }
       if (this.fileSet == null) {
         // Default file set per dataset

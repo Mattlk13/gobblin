@@ -25,11 +25,13 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 import lombok.Getter;
+import lombok.Setter;
 
 import org.apache.gobblin.annotation.Alpha;
 
@@ -46,6 +48,11 @@ public class Dag<T> {
   // Map to maintain parent to children mapping.
   private Map<DagNode, List<DagNode<T>>> parentChildMap;
   private List<DagNode<T>> nodes;
+
+  @Setter
+  private String message;
+  @Setter
+  private String flowEvent;
 
   public Dag(List<DagNode<T>> dagNodes) {
     this.nodes = dagNodes;
@@ -283,14 +290,6 @@ public class Dag<T> {
    */
   @Override
   public String toString() {
-    StringBuffer sb = new StringBuffer();
-    sb.append("[");
-    for (DagNode node: this.getNodes()) {
-      sb.append(node.getValue().toString());
-      sb.append(",");
-    }
-    sb.delete(sb.length()-1, sb.length());
-    sb.append("]");
-    return sb.toString();
+    return this.getNodes().stream().map(node -> node.getValue().toString()).collect(Collectors.toList()).toString();
   }
 }

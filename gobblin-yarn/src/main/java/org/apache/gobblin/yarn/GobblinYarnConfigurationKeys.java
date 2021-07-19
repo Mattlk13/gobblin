@@ -44,9 +44,12 @@ public class GobblinYarnConfigurationKeys {
   public static final String APP_MASTER_JARS_KEY = GOBBLIN_YARN_PREFIX + "app.master.jars";
   public static final String APP_MASTER_FILES_LOCAL_KEY = GOBBLIN_YARN_PREFIX + "app.master.files.local";
   public static final String APP_MASTER_FILES_REMOTE_KEY = GOBBLIN_YARN_PREFIX + "app.master.files.remote";
+  public static final String APP_MASTER_ZIPS_REMOTE_KEY = GOBBLIN_YARN_PREFIX + "app.master.zips.remote";
   public static final String APP_MASTER_WORK_DIR_NAME = "appmaster";
   public static final String APP_MASTER_JVM_ARGS_KEY = GOBBLIN_YARN_PREFIX + "app.master.jvm.args";
   public static final String APP_MASTER_SERVICE_CLASSES = GOBBLIN_YARN_PREFIX + "app.master.serviceClasses";
+  public static final String APP_MASTER_MAX_ATTEMPTS_KEY = GOBBLIN_YARN_PREFIX + "app.master.max.attempts";
+  public static final int DEFAULT_APP_MASTER_MAX_ATTEMPTS_KEY = 10;
   // Amount of overhead to subtract when computing the Xmx value. This is to account for non-heap memory, like metaspace
   // and stack memory
   public static final String APP_MASTER_JVM_MEMORY_OVERHEAD_MBS_KEY = GOBBLIN_YARN_PREFIX + "app.master.jvmMemoryOverheadMbs";
@@ -62,6 +65,7 @@ public class GobblinYarnConfigurationKeys {
   public static final String CONTAINER_JARS_KEY = GOBBLIN_YARN_PREFIX + "container.jars";
   public static final String CONTAINER_FILES_LOCAL_KEY = GOBBLIN_YARN_PREFIX + "container.files.local";
   public static final String CONTAINER_FILES_REMOTE_KEY = GOBBLIN_YARN_PREFIX + "container.files.remote";
+  public static final String CONTAINER_ZIPS_REMOTE_KEY = GOBBLIN_YARN_PREFIX + "container.zips.remote";
   public static final String CONTAINER_WORK_DIR_NAME = "container";
   public static final String CONTAINER_JVM_ARGS_KEY = GOBBLIN_YARN_PREFIX + "container.jvm.args";
   public static final String CONTAINER_HOST_AFFINITY_ENABLED = GOBBLIN_YARN_PREFIX + "container.affinity.enabled";
@@ -88,6 +92,7 @@ public class GobblinYarnConfigurationKeys {
   public static final String TOKEN_RENEW_INTERVAL_IN_MINUTES = GOBBLIN_YARN_PREFIX + "token.renew.interval.minutes";
   public static final Long DEFAULT_TOKEN_RENEW_INTERVAL_IN_MINUTES = Long.MAX_VALUE;
   // Resource/dependencies configuration properties.
+  // Missing this configuration should throw fatal exceptions to avoid harder-to-debug situation from Yarn container side.
   public static final String LIB_JARS_DIR_KEY = GOBBLIN_YARN_PREFIX + "lib.jars.dir";
 
   public static final String LIB_JARS_DIR_NAME = "_libjars";
@@ -112,4 +117,14 @@ public class GobblinYarnConfigurationKeys {
 
   //Configuration properties relating to container mode of execution e.g. Gobblin cluster runs on Yarn
   public static final String CONTAINER_NUM_KEY = "container.num";
+
+  //Configuration to allow GobblinYarnAppLauncher to exit without killing the Gobblin-on-Yarn application
+  public static final String GOBBLIN_YARN_DETACH_ON_EXIT_ENABLED = GOBBLIN_YARN_PREFIX + "detach.on.exit.enabled";
+  public static final boolean DEFAULT_GOBBLIN_YARN_DETACH_ON_EXIT = false;
+
+  //Configuration to set log levels for classes in Azkaban mode
+  public static final String GOBBLIN_YARN_AZKABAN_CLASS_LOG_LEVELS = GOBBLIN_YARN_PREFIX + "azkaban.class.logLevels";
+  //Container classpaths properties
+  public static final String GOBBLIN_YARN_ADDITIONAL_CLASSPATHS = GOBBLIN_YARN_PREFIX + "additional.classpaths";
+  public static final String GOBBLIN_YARN_CLASSPATHS = GOBBLIN_YARN_PREFIX + "classpaths";
 }

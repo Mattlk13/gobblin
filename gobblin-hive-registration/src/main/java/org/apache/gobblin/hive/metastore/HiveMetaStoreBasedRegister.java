@@ -17,6 +17,7 @@
 
 package org.apache.gobblin.hive.metastore;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
@@ -29,14 +30,15 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import lombok.extern.slf4j.Slf4j;
 
+import org.apache.avro.Schema;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.apache.gobblin.hive.AutoCloseableHiveLock;
-import org.apache.gobblin.kafka.schemareg.KafkaSchemaRegistry;
-import org.apache.gobblin.kafka.schemareg.KafkaSchemaRegistryFactory;
-import org.apache.gobblin.kafka.schemareg.SchemaRegistryException;
+import org.apache.gobblin.metrics.kafka.KafkaSchemaRegistry;
 import org.apache.gobblin.source.extractor.extract.kafka.KafkaSource;
+import org.apache.gobblin.util.AvroUtils;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
@@ -91,6 +93,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
 
   public static final String HIVE_REGISTER_METRICS_PREFIX = "hiveRegister.";
   public static final String ADD_PARTITION_TIMER = HIVE_REGISTER_METRICS_PREFIX + "addPartitionTimerTimer";
+  public static final String SCHEMA_SOURCE_DB = HIVE_REGISTER_METRICS_PREFIX + "schema.source.dbName";
   public static final String GET_HIVE_PARTITION = HIVE_REGISTER_METRICS_PREFIX + "getPartitionTimer";
   public static final String ALTER_PARTITION = HIVE_REGISTER_METRICS_PREFIX + "alterPartitionTimer";
   public static final String TABLE_EXISTS = HIVE_REGISTER_METRICS_PREFIX + "tableExistsTimer";
@@ -99,6 +102,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
   public static final String CREATE_HIVE_DATABASE = HIVE_REGISTER_METRICS_PREFIX + "createDatabaseTimer";
   public static final String CREATE_HIVE_TABLE = HIVE_REGISTER_METRICS_PREFIX + "createTableTimer";
   public static final String GET_HIVE_TABLE = HIVE_REGISTER_METRICS_PREFIX + "getTableTimer";
+  public static final String GET_SCHEMA_SOURCE_HIVE_TABLE = HIVE_REGISTER_METRICS_PREFIX + "getSchemaSourceTableTimer";
   public static final String GET_AND_SET_LATEST_SCHEMA = HIVE_REGISTER_METRICS_PREFIX + "getAndSetLatestSchemaTimer";
   public static final String DROP_TABLE = HIVE_REGISTER_METRICS_PREFIX + "dropTableTimer";
   public static final String PATH_REGISTER_TIMER = HIVE_REGISTER_METRICS_PREFIX + "pathRegisterTimer";
@@ -142,23 +146,26 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
 
 
   private final boolean optimizedChecks;
+  private final State state;
   //If this is true, after we know the partition is existing, we will skip the partition in stead of getting the existing
   // partition and computing the diff to see if it needs to be updated. Use this only when you can make sure the metadata
   //for a partition is immutable
   private final boolean skipDiffComputation;
 
-  private Optional<KafkaSchemaRegistry> schemaRegistry = Optional.absent();
+  @VisibleForTesting
+  protected Optional<KafkaSchemaRegistry> schemaRegistry = Optional.absent();
   private String topicName = "";
   public HiveMetaStoreBasedRegister(State state, Optional<String> metastoreURI) throws IOException {
     super(state);
+    this.state = state;
     this.locks = new HiveLock(state.getProperties());
 
-    this.optimizedChecks = state.getPropAsBoolean(this.OPTIMIZED_CHECK_ENABLED, true);
-    this.skipDiffComputation = state.getPropAsBoolean(this.SKIP_PARTITION_DIFF_COMPUTATION, false);
-    this.shouldUpdateLatestSchema = state.getPropAsBoolean(this.FETCH_LATEST_SCHEMA, false);
-    this.registerPartitionWithPullMode = state.getPropAsBoolean(this.REGISTER_PARTITION_WITH_PULL_MODE, false);
-    if(state.getPropAsBoolean(this.FETCH_LATEST_SCHEMA, false)) {
-      this.schemaRegistry = Optional.of(KafkaSchemaRegistryFactory.getSchemaRegistry(state.getProperties()));
+    this.optimizedChecks = state.getPropAsBoolean(OPTIMIZED_CHECK_ENABLED, true);
+    this.skipDiffComputation = state.getPropAsBoolean(SKIP_PARTITION_DIFF_COMPUTATION, false);
+    this.shouldUpdateLatestSchema = state.getPropAsBoolean(FETCH_LATEST_SCHEMA, false);
+    this.registerPartitionWithPullMode = state.getPropAsBoolean(REGISTER_PARTITION_WITH_PULL_MODE, false);
+    if(this.shouldUpdateLatestSchema) {
+      this.schemaRegistry = Optional.of(KafkaSchemaRegistry.get(state.getProperties()));
       topicName = state.getProp(KafkaSource.TOPIC_NAME);
     }
 
@@ -179,6 +186,15 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
         AutoReturnableObject<IMetaStoreClient> client = this.clientPool.getClient()) {
       Table table = HiveMetaStoreUtils.getTable(spec.getTable());
 
+      // Abort the rest of operations if a view is seen.
+      if (table.getTableType().equals(TableType.VIRTUAL_VIEW.name())) {
+        String msg = "Cannot register paths against a view on Hive for:" + spec.getPath()
+            + " on table:" + spec.getTable().toString();
+        log.info(msg);
+        HiveMetaStoreEventHelper.submitFailedPathRegistration(eventSubmitter, spec,
+            new UnsupportedOperationException(msg));
+      }
+
       createDbIfNotExists(client.get(), table.getDbName());
       createOrAlterTable(client.get(), table, spec);
 
@@ -192,16 +208,57 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
       throw new IOException(e);
     }
   }
-  //TODO: We need to find a better to get the latest schema
-  private void updateSchema(HiveSpec spec, Table table) throws IOException{
 
-    if (this.schemaRegistry.isPresent()) {
+  /**
+   * This method is used to update the table schema to the latest schema
+   * It will fetch creation time of the latest schema from schema registry and compare that
+   * with the creation time of writer's schema. If they are the same, then we will update the
+   * table schema to the writer's schema, else we will keep the table schema the same as schema of
+   * existing table.
+   * Note: If there is no schema specified in the table spec, we will directly update the schema to
+   * the existing table schema
+   * Note: We cannot treat the creation time as version number of schema, since schema registry allows
+   * "out of order registration" of schemas, this means chronological latest is NOT what the registry considers latest.
+   * @param spec
+   * @param table
+   * @param existingTable
+   * @throws IOException
+   */
+  @VisibleForTesting
+  protected void updateSchema(HiveSpec spec, Table table, HiveTable existingTable) throws IOException{
+
+    if (this.schemaRegistry.isPresent() && existingTable.getSerDeProps().getProp(
+        AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName()) != null) {
       try (Timer.Context context = this.metricContext.timer(GET_AND_SET_LATEST_SCHEMA).time()) {
-        String latestSchema = this.schemaRegistry.get().getLatestSchema(topicName).toString();
-        spec.getTable().getSerDeProps().setProp(AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName(), latestSchema);
-        table.getSd().setSerdeInfo(HiveMetaStoreUtils.getSerDeInfo(spec.getTable()));
-      } catch (SchemaRegistryException | IOException e) {
-        log.error(String.format("Error when fetch latest schema for topic %s", topicName), e);
+        Schema existingTableSchema = new Schema.Parser().parse(existingTable.getSerDeProps().getProp(
+            AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName()));
+        String existingSchemaCreationTime = AvroUtils.getSchemaCreationTime(existingTableSchema);
+        // If no schema set for the table spec, we fall back to existing schema
+        if (spec.getTable().getSerDeProps().getProp(AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName()) == null) {
+          spec.getTable()
+              .getSerDeProps()
+              .setProp(AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName(), existingTableSchema);
+          table.getSd().setSerdeInfo(HiveMetaStoreUtils.getSerDeInfo(spec.getTable()));
+          return;
+        }
+        Schema writerSchema = new Schema.Parser().parse((
+            spec.getTable().getSerDeProps().getProp(AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName())));
+        String writerSchemaCreationTime = AvroUtils.getSchemaCreationTime(writerSchema);
+        if(existingSchemaCreationTime != null && !existingSchemaCreationTime.equals(writerSchemaCreationTime)) {
+          // If creation time of writer schema does not equal to the existing schema, we compare with schema fetched from
+          // schema registry to determine whether to update the schema
+          Schema latestSchema = (Schema) this.schemaRegistry.get().getLatestSchemaByTopic(topicName);
+          String latestSchemaCreationTime = AvroUtils.getSchemaCreationTime(latestSchema);
+          if (latestSchemaCreationTime != null && latestSchemaCreationTime.equals(existingSchemaCreationTime)) {
+            // If latest schema creation time equals to existing schema creation time, we keep the schema as existing table schema
+            spec.getTable()
+                .getSerDeProps()
+                .setProp(AvroSerdeUtils.AvroTableProperties.SCHEMA_LITERAL.getPropName(), existingTableSchema);
+            table.getSd().setSerdeInfo(HiveMetaStoreUtils.getSerDeInfo(spec.getTable()));
+          }
+        }
+      } catch ( IOException e) {
+        log.error(String.format("Error when updating latest schema for topic %s", topicName));
         throw new IOException(e);
       }
     }
@@ -222,6 +279,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
           log.info(String.format("Created Hive table %s in db %s", tableName, dbName));
           return true;
         } catch (AlreadyExistsException e) {
+          log.debug("Table {}.{} already existed", table.getDbName(), table.getTableName());
         }
       }catch (TException e) {
         log.error(
@@ -235,8 +293,16 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
         try (Timer.Context context = this.metricContext.timer(GET_HIVE_TABLE).time()) {
           existingTable = HiveMetaStoreUtils.getHiveTable(client.getTable(dbName, tableName));
         }
+        HiveTable schemaSourceTable = existingTable;
+        if (state.contains(SCHEMA_SOURCE_DB)) {
+          try (Timer.Context context = this.metricContext.timer(GET_SCHEMA_SOURCE_HIVE_TABLE).time()) {
+            // We assume the schema source table has the same table name as the origin table, so only the db name can be configured
+            schemaSourceTable = HiveMetaStoreUtils.getHiveTable(client.getTable(state.getProp(SCHEMA_SOURCE_DB, dbName),
+                tableName));
+          }
+        }
         if(shouldUpdateLatestSchema) {
-          updateSchema(spec, table);
+          updateSchema(spec, table, schemaSourceTable);
         }
         if (needToUpdateTable(existingTable, HiveMetaStoreUtils.getHiveTable(table))) {
           try (Timer.Context context = this.metricContext.timer(ALTER_TABLE).time()) {
@@ -313,7 +379,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
           }
         });
       } catch (ExecutionException ee) {
-        throw new IOException("Database existence checking throwing execution exception.");
+        throw new IOException("Database existence checking throwing execution exception.", ee);
       }
       return retVal;
     } else {
@@ -337,8 +403,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
   @Deprecated
   @Override
   public boolean createTableIfNotExists(HiveTable table) throws IOException {
-    try (AutoReturnableObject<IMetaStoreClient> client = this.clientPool.getClient();
-        AutoCloseableHiveLock lock = this.locks.getTableLock(table.getDbName(), table.getTableName())) {
+    try (AutoReturnableObject<IMetaStoreClient> client = this.clientPool.getClient()) {
       return createTableIfNotExists(client.get(), HiveMetaStoreUtils.getTable(table), table);
     }
   }
@@ -412,7 +477,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
           }
         });
       } catch (ExecutionException ee) {
-        throw new IOException("Table existence checking throwing execution exception.");
+        throw new IOException("Table existence checking throwing execution exception.", ee);
       }
     } else {
       this.ensureHiveTableExistenceBeforeAlternation(tableName, dbName, client, table, spec);

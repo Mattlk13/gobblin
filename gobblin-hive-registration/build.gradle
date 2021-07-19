@@ -33,13 +33,11 @@ dependencies {
   compile externalDependency.hiveMetastore
   compile externalDependency.hiveSerDe
   compile externalDependency.libthrift
-  compile externalDependency.log4j
   compile externalDependency.slf4j
   compile externalDependency.commonsIo
   compile externalDependency.commonsLang3
   compile externalDependency.commonsPool
   compile externalDependency.findBugsAnnotations
-  compile externalDependency.lombok
   compile externalDependency.avroMapredH2
 
   testCompile externalDependency.testng
@@ -47,3 +45,9 @@ dependencies {
 }
 
 ext.classification="library"
+
+configurations {
+  compile {
+    exclude group: "org.pentaho"
+  }
+}

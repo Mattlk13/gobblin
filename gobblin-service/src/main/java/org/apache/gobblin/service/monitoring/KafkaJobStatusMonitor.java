@@ -24,7 +24,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import com.google.common.base.Charsets;
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
@@ -33,18 +34,26 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 
 import avro.shaded.com.google.common.annotations.VisibleForTesting;
-import kafka.message.MessageAndMetadata;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
+import org.apache.gobblin.configuration.WorkUnitState;
+import org.apache.gobblin.kafka.client.DecodeableKafkaRecord;
 import org.apache.gobblin.metastore.FileContextBasedFsStateStore;
 import org.apache.gobblin.metastore.FileContextBasedFsStateStoreFactory;
 import org.apache.gobblin.metastore.StateStore;
-import org.apache.gobblin.metastore.util.StateStoreCleanerRunnable;
+import org.apache.gobblin.metrics.GobblinTrackingEvent;
+import org.apache.gobblin.metrics.ServiceMetricNames;
 import org.apache.gobblin.metrics.event.TimingEvent;
+import org.apache.gobblin.runtime.TaskContext;
 import org.apache.gobblin.runtime.kafka.HighLevelConsumer;
+import org.apache.gobblin.runtime.retention.DatasetCleanerTask;
+import org.apache.gobblin.runtime.troubleshooter.IssueEventBuilder;
+import org.apache.gobblin.runtime.troubleshooter.JobIssueEventHandler;
 import org.apache.gobblin.service.ExecutionStatus;
+import org.apache.gobblin.service.ServiceConfigKeys;
+import org.apache.gobblin.source.workunit.WorkUnit;
 import org.apache.gobblin.util.ConfigUtils;
 
 
@@ -58,8 +67,11 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
   static final String JOB_STATUS_MONITOR_PREFIX = "jobStatusMonitor";
   //We use table suffix that is different from the Gobblin job state store suffix of jst to avoid confusion.
   //gst refers to the state store suffix for GaaS-orchestrated Gobblin jobs.
-  public static final String STATE_STORE_TABLE_SUFFIX = "gst";
-  public static final String STATE_STORE_KEY_SEPARATION_CHARACTER = ".";
+  public static final String GET_AND_SET_JOB_STATUS = MetricRegistry.name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX,
+      JOB_STATUS_MONITOR_PREFIX,  "getAndSetJobStatus");
+
+  private static final String PROCESS_JOB_ISSUE = MetricRegistry
+      .name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX, JOB_STATUS_MONITOR_PREFIX, "jobIssueProcessingTime");
 
   static final String JOB_STATUS_MONITOR_TOPIC_KEY = "topic";
   static final String JOB_STATUS_MONITOR_NUM_THREADS_KEY = "numThreads";
@@ -76,11 +88,13 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
       KAFKA_AUTO_OFFSET_RESET_KEY, KAFKA_AUTO_OFFSET_RESET_SMALLEST));
 
   private static final List<ExecutionStatus> ORDERED_EXECUTION_STATUSES = ImmutableList
-      .of(ExecutionStatus.COMPILED, ExecutionStatus.PENDING, ExecutionStatus.PENDING_RETRY,
+      .of(ExecutionStatus.COMPILED, ExecutionStatus.PENDING, ExecutionStatus.PENDING_RESUME, ExecutionStatus.PENDING_RETRY,
           ExecutionStatus.ORCHESTRATED, ExecutionStatus.RUNNING, ExecutionStatus.COMPLETE,
           ExecutionStatus.FAILED, ExecutionStatus.CANCELLED);
 
-  public KafkaJobStatusMonitor(String topic, Config config, int numThreads)
+  private final JobIssueEventHandler jobIssueEventHandler;
+
+  public KafkaJobStatusMonitor(String topic, Config config, int numThreads, JobIssueEventHandler jobIssueEventHandler)
       throws ReflectiveOperationException {
     super(topic, config.withFallback(DEFAULTS), numThreads);
     String stateStoreFactoryClass = ConfigUtils.getString(config, ConfigurationKeys.STATE_STORE_FACTORY_CLASS_KEY, FileContextBasedFsStateStoreFactory.class.getName());
@@ -88,13 +102,21 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
     this.stateStore =
         ((StateStore.Factory) Class.forName(stateStoreFactoryClass).newInstance()).createStateStore(config, org.apache.gobblin.configuration.State.class);
     this.scheduledExecutorService = Executors.newScheduledThreadPool(1);
+
+    this.jobIssueEventHandler = jobIssueEventHandler;
   }
 
   @Override
   protected void startUp() {
     super.startUp();
     log.info("Scheduling state store cleaner..");
-    scheduledExecutorService.scheduleAtFixedRate(new StateStoreCleanerRunnable(this.config), 300, 86400L, TimeUnit.SECONDS);
+    org.apache.gobblin.configuration.State state = new org.apache.gobblin.configuration.State(ConfigUtils.configToProperties(this.config));
+    state.setProp(ConfigurationKeys.JOB_ID_KEY, "GobblinServiceJobStatusCleanerJob");
+    state.setProp(ConfigurationKeys.TASK_ID_KEY, "GobblinServiceJobStatusCleanerTask");
+
+    TaskContext taskContext = new TaskContext(new WorkUnitState(WorkUnit.createEmpty(), state));
+    DatasetCleanerTask cleanerTask = new DatasetCleanerTask(taskContext);
+    scheduledExecutorService.scheduleAtFixedRate(cleanerTask, 300L, 86400L, TimeUnit.SECONDS);
   }
 
   @Override
@@ -104,7 +126,7 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
      try {
        this.scheduledExecutorService.awaitTermination(30, TimeUnit.SECONDS);
      } catch (InterruptedException e) {
-       log.error("Exception {} encountered when shutting down state store cleaner", e);
+       log.error("Exception encountered when shutting down state store cleaner", e);
      }
   }
 
@@ -114,15 +136,29 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
   }
 
   @Override
-  protected void processMessage(MessageAndMetadata<byte[],byte[]> message) {
+  protected void processMessage(DecodeableKafkaRecord<byte[],byte[]> message) {
     try {
-      org.apache.gobblin.configuration.State jobStatus = parseJobStatus(message.message());
+      GobblinTrackingEvent gobblinTrackingEvent = deserializeEvent(message);
+
+      if (gobblinTrackingEvent == null) {
+        return;
+      }
+
+      if (IssueEventBuilder.isIssueEvent(gobblinTrackingEvent)) {
+        try (Timer.Context context = getMetricContext().timer(PROCESS_JOB_ISSUE).time()) {
+          jobIssueEventHandler.processEvent(gobblinTrackingEvent);
+        }
+      }
+
+      org.apache.gobblin.configuration.State jobStatus = parseJobStatus(gobblinTrackingEvent);
       if (jobStatus != null) {
-        addJobStatusToStateStore(jobStatus, this.stateStore);
+        try(Timer.Context context = getMetricContext().timer(GET_AND_SET_JOB_STATUS).time()) {
+          addJobStatusToStateStore(jobStatus, this.stateStore);
+        }
       }
     } catch (IOException ioe) {
-      String messageStr = new String(message.message(), Charsets.UTF_8);
-      log.error(String.format("Failed to parse kafka message with offset %d: %s.", message.offset(), messageStr), ioe);
+      // Throw RuntimeException to avoid advancing kafka offsets without updating state store
+      throw new RuntimeException("Failed to add job status to state store for kafka offset " + message.getOffset(), ioe);
     }
   }
 
@@ -157,15 +193,16 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
       String previousStatus = states.get(states.size() - 1).getProp(JobStatusRetriever.EVENT_NAME_FIELD);
       String currentStatus = jobStatus.getProp(JobStatusRetriever.EVENT_NAME_FIELD);
 
-      if (previousStatus != null && currentStatus != null && ORDERED_EXECUTION_STATUSES.indexOf(ExecutionStatus.valueOf(currentStatus))
-          < ORDERED_EXECUTION_STATUSES.indexOf(ExecutionStatus.valueOf(previousStatus))) {
+      // PENDING_RESUME is allowed to override, because it happens when a flow is being resumed from previously being failed
+      if (previousStatus != null && currentStatus != null && !currentStatus.equals(ExecutionStatus.PENDING_RESUME.name())
+        && ORDERED_EXECUTION_STATUSES.indexOf(ExecutionStatus.valueOf(currentStatus)) < ORDERED_EXECUTION_STATUSES.indexOf(ExecutionStatus.valueOf(previousStatus))) {
         log.warn(String.format("Received status %s when status is already %s for flow (%s, %s, %s), job (%s, %s)",
             currentStatus, previousStatus, flowGroup, flowName, flowExecutionId, jobGroup, jobName));
-        return;
+        jobStatus = mergeState(states.get(states.size() - 1), jobStatus);
+      } else {
+        jobStatus = mergeState(jobStatus, states.get(states.size() - 1));
       }
     }
-
-    jobStatus = mergedProperties(jobStatus, states);
 
     modifyStateIfRetryRequired(jobStatus);
 
@@ -182,20 +219,26 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
     }
   }
 
-  private static org.apache.gobblin.configuration.State mergedProperties(org.apache.gobblin.configuration.State jobStatus,
-      List<org.apache.gobblin.configuration.State> states) {
-    Properties mergedProperties = new Properties();
+  /**
+   * Merge states based on precedence defined by {@link #ORDERED_EXECUTION_STATUSES}.
+   * The state instance in the 1st argument reflects the more recent state of a job
+   * (and is thus, given higher priority) compared to the 2nd argument.
+   * @param state higher priority state
+   * @param fallbackState lower priority state
+   * @return merged state
+   */
+  private static org.apache.gobblin.configuration.State mergeState(org.apache.gobblin.configuration.State state,
+      org.apache.gobblin.configuration.State fallbackState) {
+    Properties mergedState = new Properties();
 
-    if (states.size() > 0) {
-      mergedProperties.putAll(states.get(states.size() - 1).getProperties());
-    }
-    mergedProperties.putAll(jobStatus.getProperties());
+    mergedState.putAll(fallbackState.getProperties());
+    mergedState.putAll(state.getProperties());
 
-    return new org.apache.gobblin.configuration.State(mergedProperties);
+    return new org.apache.gobblin.configuration.State(mergedState);
   }
 
   public static String jobStatusTableName(String flowExecutionId, String jobGroup, String jobName) {
-    return Joiner.on(STATE_STORE_KEY_SEPARATION_CHARACTER).join(flowExecutionId, jobGroup, jobName, STATE_STORE_TABLE_SUFFIX);
+    return Joiner.on(ServiceConfigKeys.STATE_STORE_KEY_SEPARATION_CHARACTER).join(flowExecutionId, jobGroup, jobName, ServiceConfigKeys.STATE_STORE_TABLE_SUFFIX);
   }
 
   public static String jobStatusTableName(long flowExecutionId, String jobGroup, String jobName) {
@@ -203,13 +246,15 @@ public abstract class KafkaJobStatusMonitor extends HighLevelConsumer<byte[], by
   }
 
   public static String jobStatusStoreName(String flowGroup, String flowName) {
-    return Joiner.on(STATE_STORE_KEY_SEPARATION_CHARACTER).join(flowGroup, flowName);
+    return Joiner.on(ServiceConfigKeys.STATE_STORE_KEY_SEPARATION_CHARACTER).join(flowGroup, flowName);
   }
 
   public static long getExecutionIdFromTableName(String tableName) {
-    return Long.parseLong(Splitter.on(STATE_STORE_KEY_SEPARATION_CHARACTER).splitToList(tableName).get(0));
+    return Long.parseLong(Splitter.on(ServiceConfigKeys.STATE_STORE_KEY_SEPARATION_CHARACTER).splitToList(tableName).get(0));
   }
 
-  public abstract org.apache.gobblin.configuration.State parseJobStatus(byte[] message) throws IOException;
+  protected abstract GobblinTrackingEvent deserializeEvent(DecodeableKafkaRecord<byte[],byte[]> message);
+
+  protected abstract org.apache.gobblin.configuration.State parseJobStatus(GobblinTrackingEvent event);
 
 }

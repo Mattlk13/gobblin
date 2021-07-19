@@ -24,14 +24,6 @@ import java.util.Properties;
 
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
-import org.apache.gobblin.publisher.DataPublisher;
-import org.apache.gobblin.publisher.NoopPublisher;
-import org.apache.gobblin.runtime.JobState;
-import org.apache.gobblin.runtime.TaskContext;
-import org.apache.gobblin.runtime.task.BaseAbstractTask;
-import org.apache.gobblin.runtime.task.TaskFactory;
-import org.apache.gobblin.runtime.task.TaskIFace;
-import org.apache.gobblin.runtime.task.TaskUtils;
 import org.apache.log4j.AppenderSkeleton;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
@@ -47,11 +39,23 @@ import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.configuration.SourceState;
 import org.apache.gobblin.configuration.WorkUnitState;
 import org.apache.gobblin.instrumented.extractor.InstrumentedExtractor;
+import org.apache.gobblin.publisher.DataPublisher;
+import org.apache.gobblin.publisher.NoopPublisher;
 import org.apache.gobblin.runtime.GobblinMultiTaskAttempt;
+import org.apache.gobblin.runtime.JobState;
+import org.apache.gobblin.runtime.TaskContext;
+import org.apache.gobblin.runtime.task.BaseAbstractTask;
+import org.apache.gobblin.runtime.task.TaskFactory;
+import org.apache.gobblin.runtime.task.TaskIFace;
+import org.apache.gobblin.runtime.task.TaskUtils;
 import org.apache.gobblin.source.Source;
 import org.apache.gobblin.source.extractor.DataRecordException;
 import org.apache.gobblin.source.extractor.Extractor;
 import org.apache.gobblin.source.workunit.WorkUnit;
+import org.apache.gobblin.util.retry.RetryerFactory;
+
+import static org.apache.gobblin.util.retry.RetryerFactory.RETRY_TIMES;
+import static org.apache.gobblin.util.retry.RetryerFactory.RETRY_TYPE;
 
 
 @Test (singleThreaded = true)
@@ -67,7 +71,7 @@ public class TaskErrorIntegrationTest extends BMNGRunner {
 
   /**
    * Test that an extractor that raises an error on creation results in a log message from {@link GobblinMultiTaskAttempt}
-   * and does not hang
+   * and does not hang.
    * @throws Exception
    */
   @Test
@@ -82,8 +86,15 @@ public class TaskErrorIntegrationTest extends BMNGRunner {
 
     jobProperties.setProperty(ConfigurationKeys.SOURCE_CLASS_KEY, BaseTestSource.class.getName());
     jobProperties.setProperty(TestExtractor.RAISE_ERROR, "true");
+    jobProperties.setProperty(RETRY_TYPE, RetryerFactory.RetryType.FIXED_ATTEMPT.name());
+    // Disable retry
+    jobProperties.setProperty(RETRY_TIMES, "1");
 
-    GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    try {
+      GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    } catch (Exception e){
+      // Expecting to get exception, do nothing
+    }
 
     Assert.assertTrue(testAppender.events.stream().anyMatch(e -> e.getRenderedMessage()
         .startsWith("Could not create task for workunit")));
@@ -92,11 +103,36 @@ public class TaskErrorIntegrationTest extends BMNGRunner {
   }
 
   /**
+   * Test when extractor failure happens as above, retry kicked in and heal the extractor itself.
+   */
+  @Test
+  public void extractorCreationErrorWithRetry() throws Exception {
+    Properties jobProperties =
+        GobblinLocalJobLauncherUtils.getJobProperties("runtime_test/skip_workunits_test.properties");
+
+    jobProperties.setProperty(ConfigurationKeys.SOURCE_CLASS_KEY, BaseTestSource.class.getName());
+    jobProperties.setProperty(TestExtractor.RAISE_ERROR, "true");
+    jobProperties.setProperty(RETRY_TYPE, RetryerFactory.RetryType.FIXED_ATTEMPT.name());
+    jobProperties.setProperty(TestExtractor.ENABLE_RETRY_FLIP, "true");
+    // Enable retry and should work for the second time.
+    jobProperties.setProperty(RETRY_TIMES, "2");
+
+    // Any failure should fail the test.
+    try {
+      GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    } catch (Throwable t) {
+      Assert.fail();
+    }
+
+    Assert.assertTrue(true);
+  }
+
+  /**
    * Test that a task submission error results in a log message from {@link GobblinMultiTaskAttempt}
    * and does not hang
    * @throws Exception
    */
-  @Test
+  @Test (enabled = false)
   @BMRule(name = "testErrorDuringSubmission", targetClass = "org.apache.gobblin.runtime.TaskExecutor",
       targetMethod = "submit(Task)", targetLocation = "AT ENTRY", condition = "true",
       action = "throw new RuntimeException(\"Exception for testErrorDuringSubmission\")")
@@ -112,7 +148,11 @@ public class TaskErrorIntegrationTest extends BMNGRunner {
     jobProperties.setProperty(ConfigurationKeys.SOURCE_CLASS_KEY, BaseTestSource.class.getName());
     jobProperties.setProperty(TestExtractor.RAISE_ERROR, "false");
 
-    GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    try {
+      GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    } catch (Exception e){
+      // Expect to get exception, do nothing
+    }
 
     Assert.assertTrue(testAppender.events.stream().anyMatch(e -> e.getRenderedMessage()
         .startsWith("Could not submit task for workunit")));
@@ -129,26 +169,43 @@ public class TaskErrorIntegrationTest extends BMNGRunner {
     Properties jobProperties =
         GobblinLocalJobLauncherUtils.getJobProperties("runtime_test/skip_workunits_test.properties");
     jobProperties.setProperty(ConfigurationKeys.SOURCE_CLASS_KEY, CustomizedTaskTestSource.class.getName());
+    // To demonstrate failure caught in task creation in test setting, disabled retry in task creation.
+    jobProperties.setProperty(RETRY_TIMES, "1");
+    jobProperties.setProperty(RETRY_TYPE, RetryerFactory.RetryType.FIXED_ATTEMPT.name());
 
-    GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
-    Assert.assertTrue(testAppender.events.stream().anyMatch(e -> e.getRenderedMessage()
-        .startsWith("Encountering memory error")));
-
+    try {
+      GobblinLocalJobLauncherUtils.invokeLocalJobLauncher(jobProperties);
+    } catch (Throwable t){
+      // Expect to get exception, do nothing
+    }
+    Assert.assertTrue(testAppender.events.stream().anyMatch(e -> e.getRenderedMessage().contains("Could not create task for workunit")));
     logger.removeAppender(testAppender);
   }
 
 
   /**
-   * Test extractor that can be configured to raise an exception on construction
+   * Test extractor that can be configured to raise an exception on construction,
+   * or heal it self after even times of retry (constructor-attempt)
    */
   public static class TestExtractor<S, D> extends InstrumentedExtractor<S, D> {
     private static final String RAISE_ERROR = "raiseError";
+    private static int RETRY_COUNT = 1;
+    private static final String ENABLE_RETRY_FLIP = "enableRetry";
 
     public TestExtractor(WorkUnitState workUnitState) {
       super(workUnitState);
 
-      if (workUnitState.getPropAsBoolean(RAISE_ERROR, false)) {
-        throw new RuntimeException(EXCEPTION_MESSAGE);
+      try {
+        if (workUnitState.getPropAsBoolean(ENABLE_RETRY_FLIP, false) && RETRY_COUNT % 2 == 0) {
+          return;
+        }
+
+        if (workUnitState.getPropAsBoolean(RAISE_ERROR, false)) {
+          throw new RuntimeException(EXCEPTION_MESSAGE);
+        }
+      } finally {
+        // Need to make sure retryCount increment at the end of each constructor.
+        RETRY_COUNT += 1;
       }
     }
 

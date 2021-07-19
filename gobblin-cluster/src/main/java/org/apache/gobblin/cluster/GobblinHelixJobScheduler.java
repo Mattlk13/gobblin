@@ -17,6 +17,7 @@
 
 package org.apache.gobblin.cluster;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -50,6 +51,7 @@ import com.google.common.util.concurrent.Striped;
 import com.typesafe.config.Config;
 
 import org.apache.gobblin.annotation.Alpha;
+import org.apache.gobblin.cluster.event.CancelJobConfigArrivalEvent;
 import org.apache.gobblin.cluster.event.DeleteJobConfigArrivalEvent;
 import org.apache.gobblin.cluster.event.NewJobConfigArrivalEvent;
 import org.apache.gobblin.cluster.event.UpdateJobConfigArrivalEvent;
@@ -84,11 +86,12 @@ import org.apache.gobblin.util.PropertiesUtils;
  * <p> More details can be found at {@link HelixRetriggeringJobCallable}.
  */
 @Alpha
-public class GobblinHelixJobScheduler extends JobScheduler implements StandardMetricsBridge{
+public class GobblinHelixJobScheduler extends JobScheduler implements StandardMetricsBridge {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(GobblinHelixJobScheduler.class);
+  private static final String COMMON_JOB_PROPS = "gobblin.common.job.props";
 
-  private final Properties properties;
+  private final Properties commonJobProperties;
   private final HelixManager jobHelixManager;
   private final Optional<HelixManager> taskDriverHelixManager;
   private final EventBus eventBus;
@@ -109,7 +112,7 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
   private boolean startServicesCompleted;
   private final long helixJobStopTimeoutMillis;
 
-  public GobblinHelixJobScheduler(Properties properties,
+  public GobblinHelixJobScheduler(Config sysConfig,
                                   HelixManager jobHelixManager,
                                   Optional<HelixManager> taskDriverHelixManager,
                                   EventBus eventBus,
@@ -117,8 +120,8 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
                                   SchedulerService schedulerService,
                                   MutableJobCatalog jobCatalog) throws Exception {
 
-    super(properties, schedulerService);
-    this.properties = properties;
+    super(ConfigUtils.configToProperties(sysConfig), schedulerService);
+    this.commonJobProperties = ConfigUtils.configToProperties(ConfigUtils.getConfigOrEmpty(sysConfig, COMMON_JOB_PROPS));
     this.jobHelixManager = jobHelixManager;
     this.taskDriverHelixManager = taskDriverHelixManager;
     this.eventBus = eventBus;
@@ -128,8 +131,7 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
     this.jobCatalog = jobCatalog;
     this.metricContext = Instrumented.getMetricContext(new org.apache.gobblin.configuration.State(properties), this.getClass());
 
-    Config jobConfig = ConfigUtils.propertiesToConfig(this.properties);
-    int metricsWindowSizeInMin = ConfigUtils.getInt(jobConfig,
+    int metricsWindowSizeInMin = ConfigUtils.getInt(sysConfig,
                                                     ConfigurationKeys.METRIC_TIMER_WINDOW_SIZE_IN_MINUTES,
                                                     ConfigurationKeys.DEFAULT_METRIC_TIMER_WINDOW_SIZE_IN_MINUTES);
 
@@ -155,10 +157,10 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
 
     this.startServicesCompleted = false;
 
-    this.helixJobStopTimeoutMillis = ConfigUtils.getLong(jobConfig, GobblinClusterConfigurationKeys.HELIX_JOB_STOP_TIMEOUT_SECONDS,
+    this.helixJobStopTimeoutMillis = ConfigUtils.getLong(sysConfig, GobblinClusterConfigurationKeys.HELIX_JOB_STOP_TIMEOUT_SECONDS,
         GobblinClusterConfigurationKeys.DEFAULT_HELIX_JOB_STOP_TIMEOUT_SECONDS) * 1000;
 
-    this.helixWorkflowListingTimeoutMillis = ConfigUtils.getLong(jobConfig, GobblinClusterConfigurationKeys.HELIX_WORKFLOW_LISTING_TIMEOUT_SECONDS,
+    this.helixWorkflowListingTimeoutMillis = ConfigUtils.getLong(sysConfig, GobblinClusterConfigurationKeys.HELIX_WORKFLOW_LISTING_TIMEOUT_SECONDS,
         GobblinClusterConfigurationKeys.DEFAULT_HELIX_WORKFLOW_LISTING_TIMEOUT_SECONDS) * 1000;
 
   }
@@ -205,9 +207,9 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
 
     if (cleanAllDistJobs) {
       for (org.apache.gobblin.configuration.State state : this.jobsMapping.getAllStates()) {
-        String jobName = state.getId();
-        LOGGER.info("Delete mapping for job " + jobName);
-        this.jobsMapping.deleteMapping(jobName);
+        String jobUri = state.getId();
+        LOGGER.info("Delete mapping for job " + jobUri);
+        this.jobsMapping.deleteMapping(jobUri);
       }
     }
   }
@@ -305,9 +307,10 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
     LOGGER.info("Received new job configuration of job " + jobUri);
     try {
       Properties jobProps = new Properties();
+      jobProps.putAll(this.commonJobProperties);
       jobProps.putAll(newJobArrival.getJobConfig());
 
-      // set uri so that we can delete it later
+      // set uri so that we can delete this job later
       jobProps.setProperty(GobblinClusterConfigurationKeys.JOB_SPEC_URI, jobUri);
 
       this.jobSchedulerMetrics.updateTimeBeforeJobScheduling(jobProps);
@@ -345,7 +348,7 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
   }
 
   private void waitForJobCompletion(String jobName) {
-    while (this.jobRunningMap.getOrDefault(jobName, false) != false) {
+    while (this.jobRunningMap.getOrDefault(jobName, false)) {
       LOGGER.info("Waiting for job {} to stop...", jobName);
       try {
         Thread.sleep(1000);
@@ -366,6 +369,42 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
     }
   }
 
+  @Subscribe
+  public void handleCancelJobConfigArrival(CancelJobConfigArrivalEvent cancelJobArrival)
+      throws InterruptedException {
+    String jobUri = cancelJobArrival.getJoburi();
+    LOGGER.info("Received cancel for job configuration of job " + jobUri);
+    Optional<String> distributedJobMode;
+    Optional<String> planningJob = Optional.empty();
+    Optional<String> actualJob = Optional.empty();
+
+    this.jobSchedulerMetrics.numCancellationStart.incrementAndGet();
+
+    try {
+      distributedJobMode = this.jobsMapping.getDistributedJobMode(jobUri);
+      if (distributedJobMode.isPresent() && Boolean.parseBoolean(distributedJobMode.get())) {
+        planningJob = this.jobsMapping.getPlanningJobId(jobUri);
+      } else {
+        actualJob = this.jobsMapping.getActualJobId(jobUri);
+      }
+    } catch (IOException e) {
+      LOGGER.warn("jobsMapping could not be retrieved for job {}", jobUri);
+      return;
+    }
+
+    if (planningJob.isPresent()) {
+      LOGGER.info("Cancelling planning job helix workflow: {}", planningJob.get());
+      new TaskDriver(this.taskDriverHelixManager.get()).waitToStop(planningJob.get(), this.helixJobStopTimeoutMillis);
+    }
+
+    if (actualJob.isPresent()) {
+      LOGGER.info("Cancelling actual job helix workflow: {}", actualJob.get());
+      new TaskDriver(this.jobHelixManager).waitToStop(actualJob.get(), this.helixJobStopTimeoutMillis);
+    }
+
+    this.jobSchedulerMetrics.numCancellationStart.decrementAndGet();
+  }
+
   private void cancelJobIfRequired(DeleteJobConfigArrivalEvent deleteJobArrival) throws InterruptedException {
     Properties jobConfig = deleteJobArrival.getJobConfig();
     if (PropertiesUtils.getPropAsBoolean(jobConfig, GobblinClusterConfigurationKeys.CANCEL_RUNNING_JOB_ON_DELETE,
@@ -377,7 +416,7 @@ public class GobblinHelixJobScheduler extends JobScheduler implements StandardMe
           Collections.singletonList(deleteJobArrival.getJobName()));
       Retryer<Map<String, String>> retryer = RetryerBuilder.<Map<String, String>>newBuilder()
           .retryIfException()
-          .withStopStrategy(StopStrategies.stopAfterAttempt(1))
+          .withStopStrategy(StopStrategies.stopAfterAttempt(5))
           .withAttemptTimeLimiter(AttemptTimeLimiters.fixedTimeLimit(this.helixWorkflowListingTimeoutMillis, TimeUnit.MILLISECONDS)).build();
       Map<String, String> jobNameToWorkflowIdMap;
       try {

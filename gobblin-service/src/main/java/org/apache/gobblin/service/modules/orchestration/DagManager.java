@@ -20,6 +20,7 @@ package org.apache.gobblin.service.modules.orchestration;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -29,12 +30,14 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang3.StringUtils;
 
@@ -48,6 +51,8 @@ import com.google.common.util.concurrent.AbstractIdleService;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 
+import javax.inject.Inject;
+import javax.inject.Singleton;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
@@ -55,28 +60,29 @@ import org.apache.gobblin.annotation.Alpha;
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.instrumented.Instrumented;
 import org.apache.gobblin.metrics.ContextAwareCounter;
+import org.apache.gobblin.metrics.ContextAwareGauge;
+import org.apache.gobblin.metrics.ContextAwareMeter;
 import org.apache.gobblin.metrics.MetricContext;
+import org.apache.gobblin.metrics.RootMetricContext;
 import org.apache.gobblin.metrics.ServiceMetricNames;
 import org.apache.gobblin.metrics.event.EventSubmitter;
 import org.apache.gobblin.metrics.event.TimingEvent;
-import org.apache.gobblin.metrics.reporter.util.MetricReportUtils;
+import org.apache.gobblin.runtime.api.FlowSpec;
 import org.apache.gobblin.runtime.api.JobSpec;
 import org.apache.gobblin.runtime.api.Spec;
 import org.apache.gobblin.runtime.api.SpecProducer;
 import org.apache.gobblin.runtime.api.TopologySpec;
 import org.apache.gobblin.service.ExecutionStatus;
-import org.apache.gobblin.service.FlowConfigResourceLocalHandler;
+import org.apache.gobblin.service.FlowId;
 import org.apache.gobblin.service.RequesterService;
 import org.apache.gobblin.service.ServiceRequester;
 import org.apache.gobblin.service.modules.flowgraph.Dag;
 import org.apache.gobblin.service.modules.flowgraph.Dag.DagNode;
 import org.apache.gobblin.service.modules.spec.JobExecutionPlan;
-import org.apache.gobblin.service.monitoring.FsJobStatusRetriever;
 import org.apache.gobblin.service.monitoring.JobStatus;
 import org.apache.gobblin.service.monitoring.JobStatusRetriever;
-import org.apache.gobblin.service.monitoring.KafkaJobStatusMonitor;
-import org.apache.gobblin.service.monitoring.KafkaJobStatusMonitorFactory;
 import org.apache.gobblin.service.monitoring.KillFlowEvent;
+import org.apache.gobblin.service.monitoring.ResumeFlowEvent;
 import org.apache.gobblin.util.ConfigUtils;
 import org.apache.gobblin.util.reflection.GobblinConstructorUtils;
 
@@ -109,6 +115,7 @@ import static org.apache.gobblin.service.ExecutionStatus.*;
  */
 @Alpha
 @Slf4j
+@Singleton
 public class DagManager extends AbstractIdleService {
   public static final String DEFAULT_FLOW_FAILURE_OPTION = FailureOption.FINISH_ALL_POSSIBLE.name();
 
@@ -120,9 +127,19 @@ public class DagManager extends AbstractIdleService {
   private static final Integer TERMINATION_TIMEOUT = 30;
   public static final String NUM_THREADS_KEY = DAG_MANAGER_PREFIX + "numThreads";
   public static final String JOB_STATUS_POLLING_INTERVAL_KEY = DAG_MANAGER_PREFIX + "pollingInterval";
-  private static final String JOB_STATUS_RETRIEVER_CLASS_KEY = JOB_STATUS_RETRIEVER_KEY + ".class";
-  private static final String DEFAULT_JOB_STATUS_RETRIEVER_CLASS = FsJobStatusRetriever.class.getName();
   private static final String DAG_STATESTORE_CLASS_KEY = DAG_MANAGER_PREFIX + "dagStateStoreClass";
+  private static final String FAILED_DAG_STATESTORE_PREFIX = "failedDagStateStore";
+  private static final String FAILED_DAG_RETENTION_TIME_UNIT = FAILED_DAG_STATESTORE_PREFIX + ".retention.timeUnit";
+  private static final String DEFAULT_FAILED_DAG_RETENTION_TIME_UNIT = "DAYS";
+  private static final String FAILED_DAG_RETENTION_TIME = FAILED_DAG_STATESTORE_PREFIX + ".retention.time";
+  private static final long DEFAULT_FAILED_DAG_RETENTION_TIME = 7L;
+  public static final String FAILED_DAG_POLLING_INTERVAL = FAILED_DAG_STATESTORE_PREFIX + ".retention.pollingIntervalMinutes";
+  public static final Integer DEFAULT_FAILED_DAG_POLLING_INTERVAL = 60;
+  private static final String USER_JOB_QUOTA_KEY = DAG_MANAGER_PREFIX + "defaultJobQuota";
+  private static final Integer DEFAULT_USER_JOB_QUOTA = Integer.MAX_VALUE;
+  private static final String PER_USER_QUOTA = DAG_MANAGER_PREFIX + "perUserQuota";
+
+  private static final String QUOTA_SEPERATOR = ":";
 
   /**
    * Action to be performed on a {@link Dag}, in case of a job failure. Currently, we allow 2 modes:
@@ -151,30 +168,38 @@ public class DagManager extends AbstractIdleService {
 
   private BlockingQueue<Dag<JobExecutionPlan>>[] queue;
   private BlockingQueue<String>[] cancelQueue;
+  private BlockingQueue<String>[] resumeQueue;
   DagManagerThread[] dagManagerThreads;
 
   private ScheduledExecutorService scheduledExecutorPool;
   private boolean instrumentationEnabled;
   private DagStateStore dagStateStore;
+  private DagStateStore failedDagStateStore;
   private Map<URI, TopologySpec> topologySpecMap;
 
   @Getter
   private final Integer numThreads;
   private final Integer pollingInterval;
+  private final Integer retentionPollingInterval;
   @Getter
   private final JobStatusRetriever jobStatusRetriever;
   private final Config config;
   private final Optional<EventSubmitter> eventSubmitter;
+  private final int defaultQuota;
+  private final Map<String, Integer> perUserQuota;
+  private final long failedDagRetentionTime;
 
   private volatile boolean isActive = false;
 
-  public DagManager(Config config, boolean instrumentationEnabled) {
+  public DagManager(Config config, JobStatusRetriever jobStatusRetriever, boolean instrumentationEnabled) {
     this.config = config;
     this.numThreads = ConfigUtils.getInt(config, NUM_THREADS_KEY, DEFAULT_NUM_THREADS);
     this.queue = initializeDagQueue(this.numThreads);
     this.cancelQueue = initializeDagQueue(this.numThreads);
+    this.resumeQueue = initializeDagQueue(this.numThreads);
     this.scheduledExecutorPool = Executors.newScheduledThreadPool(numThreads);
     this.pollingInterval = ConfigUtils.getInt(config, JOB_STATUS_POLLING_INTERVAL_KEY, DEFAULT_JOB_STATUS_POLLING_INTERVAL);
+    this.retentionPollingInterval = ConfigUtils.getInt(config, FAILED_DAG_POLLING_INTERVAL, DEFAULT_FAILED_DAG_POLLING_INTERVAL);
     this.instrumentationEnabled = instrumentationEnabled;
     if (instrumentationEnabled) {
       MetricContext metricContext = Instrumented.getMetricContext(ConfigUtils.configToState(ConfigFactory.empty()), getClass());
@@ -183,20 +208,16 @@ public class DagManager extends AbstractIdleService {
       this.eventSubmitter = Optional.absent();
     }
 
-    try {
-      this.jobStatusRetriever = createJobStatusRetriever(config);
-    } catch (ReflectiveOperationException e) {
-      throw new RuntimeException("Exception encountered during DagManager initialization", e);
+    this.defaultQuota = ConfigUtils.getInt(config, USER_JOB_QUOTA_KEY, DEFAULT_USER_JOB_QUOTA);
+    this.perUserQuota = new HashMap<>();
+    for (String userQuota : ConfigUtils.getStringList(config, PER_USER_QUOTA)) {
+      this.perUserQuota.put(userQuota.split(QUOTA_SEPERATOR)[0], Integer.parseInt(userQuota.split(QUOTA_SEPERATOR)[1]));
     }
-  }
 
-  JobStatusRetriever createJobStatusRetriever(Config config) throws ReflectiveOperationException {
-    Class jobStatusRetrieverClass = Class.forName(ConfigUtils.getString(config, JOB_STATUS_RETRIEVER_CLASS_KEY, DEFAULT_JOB_STATUS_RETRIEVER_CLASS));
-    return (JobStatusRetriever) GobblinConstructorUtils.invokeLongestConstructor(jobStatusRetrieverClass, config);
-  }
+    this.jobStatusRetriever = jobStatusRetriever;
 
-  KafkaJobStatusMonitor createJobStatusMonitor(Config config) throws ReflectiveOperationException {
-    return new KafkaJobStatusMonitorFactory().createJobStatusMonitor(config);
+    TimeUnit timeUnit = TimeUnit.valueOf(ConfigUtils.getString(config, FAILED_DAG_RETENTION_TIME_UNIT, DEFAULT_FAILED_DAG_RETENTION_TIME_UNIT));
+    this.failedDagRetentionTime = timeUnit.toMillis(ConfigUtils.getLong(config, FAILED_DAG_RETENTION_TIME, DEFAULT_FAILED_DAG_RETENTION_TIME));
   }
 
   DagStateStore createDagStateStore(Config config, Map<URI, TopologySpec> topologySpecMap) {
@@ -218,8 +239,9 @@ public class DagManager extends AbstractIdleService {
     return queue;
   }
 
-  public DagManager(Config config) {
-    this(config, true);
+  @Inject
+  public DagManager(Config config, JobStatusRetriever jobStatusRetriever) {
+    this(config, jobStatusRetriever, true);
   }
 
   /** Start the service. On startup, the service launches a fixed pool of {@link DagManagerThread}s, which are scheduled at
@@ -236,8 +258,9 @@ public class DagManager extends AbstractIdleService {
    * by one of the {@link DagManagerThread}s.
    * @param dag {@link Dag} to be added
    * @param persist whether to persist the dag to the {@link DagStateStore}
+   * @param setStatus if true, set all jobs in the dag to pending
    */
-  synchronized void addDag(Dag<JobExecutionPlan> dag, boolean persist) throws IOException {
+  synchronized void addDag(Dag<JobExecutionPlan> dag, boolean persist, boolean setStatus) throws IOException {
     if (persist) {
       //Persist the dag
       this.dagStateStore.writeCheckpoint(dag);
@@ -250,7 +273,9 @@ public class DagManager extends AbstractIdleService {
     if (!this.queue[queueId].offer(dag)) {
       throw new IOException("Could not add dag" + DagManagerUtils.generateDagId(dag) + "to queue");
     }
-    submitEventsAndSetStatus(dag);
+    if (setStatus) {
+      submitEventsAndSetStatus(dag);
+    }
   }
 
   private void submitEventsAndSetStatus(Dag<JobExecutionPlan> dag) {
@@ -269,8 +294,8 @@ public class DagManager extends AbstractIdleService {
    * The {@link DagManager} adds the dag to the {@link BlockingQueue} to be picked up by one of the {@link DagManagerThread}s.
    */
   synchronized public void stopDag(URI uri) throws IOException {
-    String flowGroup = FlowConfigResourceLocalHandler.FlowUriUtils.getFlowGroup(uri);
-    String flowName = FlowConfigResourceLocalHandler.FlowUriUtils.getFlowName(uri);
+    String flowGroup = FlowSpec.Utils.getFlowGroup(uri);
+    String flowName = FlowSpec.Utils.getFlowName(uri);
 
     List<Long> flowExecutionIds = this.jobStatusRetriever.getLatestExecutionIdsForFlow(flowName, flowGroup, 10);
     log.info("Found {} flows to cancel.", flowExecutionIds.size());
@@ -301,6 +326,16 @@ public class DagManager extends AbstractIdleService {
     }
   }
 
+  @Subscribe
+  public void handleResumeFlowEvent(ResumeFlowEvent resumeFlowEvent) {
+    log.info("Received resume request for flow ({}, {}, {})", resumeFlowEvent.getFlowGroup(), resumeFlowEvent.getFlowName(), resumeFlowEvent.getFlowExecutionId());
+    String dagId = DagManagerUtils.generateDagId(resumeFlowEvent.getFlowGroup(), resumeFlowEvent.getFlowName(), resumeFlowEvent.getFlowExecutionId());
+    int queueId = DagManagerUtils.getDagQueueId(resumeFlowEvent.getFlowExecutionId(), this.numThreads);
+    if (!this.resumeQueue[queueId].offer(dagId)) {
+      log.warn("Could not add dag " + dagId + " to resume queue");
+    }
+  }
+
   public synchronized void setTopologySpecMap(Map<URI, TopologySpec> topologySpecMap) {
     this.topologySpecMap = topologySpecMap;
   }
@@ -323,17 +358,34 @@ public class DagManager extends AbstractIdleService {
         log.info("Scheduling {} DagManager threads", numThreads);
         //Initializing state store for persisting Dags.
         this.dagStateStore = createDagStateStore(config, topologySpecMap);
+        this.failedDagStateStore = createDagStateStore(ConfigUtils.getConfigOrEmpty(config, FAILED_DAG_STATESTORE_PREFIX).withFallback(config), topologySpecMap);
+        Set<String> failedDagIds = Collections.synchronizedSet(this.failedDagStateStore.getDagIds());
+
+        ContextAwareMeter allSuccessfulMeter = null;
+        ContextAwareMeter allFailedMeter = null;
+        if (instrumentationEnabled) {
+          MetricContext metricContext = Instrumented.getMetricContext(ConfigUtils.configToState(ConfigFactory.empty()), getClass());
+          allSuccessfulMeter = metricContext.contextAwareMeter(MetricRegistry.name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX,
+              ServiceMetricNames.SUCCESSFUL_FLOW_METER));
+          allFailedMeter = metricContext.contextAwareMeter(MetricRegistry.name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX,
+              ServiceMetricNames.FAILED_FLOW_METER));
+        }
 
         //On startup, the service creates DagManagerThreads that are scheduled at a fixed rate.
         this.dagManagerThreads = new DagManagerThread[numThreads];
         for (int i = 0; i < numThreads; i++) {
-          DagManagerThread dagManagerThread = new DagManagerThread(jobStatusRetriever, dagStateStore,
-              queue[i], cancelQueue[i], instrumentationEnabled);
+          DagManagerThread dagManagerThread = new DagManagerThread(jobStatusRetriever, dagStateStore, failedDagStateStore,
+              queue[i], cancelQueue[i], resumeQueue[i], instrumentationEnabled, defaultQuota, perUserQuota, failedDagIds,
+              allSuccessfulMeter, allFailedMeter);
           this.dagManagerThreads[i] = dagManagerThread;
           this.scheduledExecutorPool.scheduleAtFixedRate(dagManagerThread, 0, this.pollingInterval, TimeUnit.SECONDS);
         }
-        for (Dag<JobExecutionPlan> dag : dagStateStore.getDags()) {
-          addDag(dag, false);
+        FailedDagRetentionThread failedDagRetentionThread = new FailedDagRetentionThread(failedDagStateStore, failedDagIds, failedDagRetentionTime);
+        this.scheduledExecutorPool.scheduleAtFixedRate(failedDagRetentionThread, 0, retentionPollingInterval, TimeUnit.MINUTES);
+        List<Dag<JobExecutionPlan>> dags = dagStateStore.getDags();
+        log.info("Loading " + dags.size() + " dags from dag state store");
+        for (Dag<JobExecutionPlan> dag : dags) {
+          addDag(dag, false, false);
         }
       } else { //Mark the DagManager inactive.
         log.info("Inactivating the DagManager. Shutting down all DagManager threads");
@@ -360,7 +412,11 @@ public class DagManager extends AbstractIdleService {
    */
   public static class DagManagerThread implements Runnable {
     private final Map<DagNode<JobExecutionPlan>, Dag<JobExecutionPlan>> jobToDag = new HashMap<>();
+    private static final Map<String, Integer> proxyUserToJobCount = new ConcurrentHashMap<>();
+    private static final Map<String, Integer> requesterToJobCount = new ConcurrentHashMap<>();
     private final Map<String, Dag<JobExecutionPlan>> dags = new HashMap<>();
+    private Set<String> failedDagIds;
+    private final Map<String, Dag<JobExecutionPlan>> resumingDags = new HashMap<>();
     // dagToJobs holds a map of dagId to running jobs of that dag
     final Map<String, LinkedList<DagNode<JobExecutionPlan>>> dagToJobs = new HashMap<>();
     final Map<String, Long> dagToSLA = new HashMap<>();
@@ -369,25 +425,47 @@ public class DagManager extends AbstractIdleService {
     private final MetricContext metricContext;
     private final Optional<EventSubmitter> eventSubmitter;
     private final Optional<Timer> jobStatusPolledTimer;
+    private final int defaultQuota;
+    private final Map<String, Integer> perUserQuota;
+    private final AtomicLong orchestrationDelay = new AtomicLong(0);
+    private static final Map<String, FlowState> flowGauges = Maps.newConcurrentMap();
+    private final ContextAwareMeter allSuccessfulMeter;
+    private final ContextAwareMeter allFailedMeter;
+    private static final Map<String, ContextAwareMeter> groupSuccessfulMeters = Maps.newConcurrentMap();
+    private static final Map<String, ContextAwareMeter> groupFailureMeters = Maps.newConcurrentMap();
 
     private JobStatusRetriever jobStatusRetriever;
     private DagStateStore dagStateStore;
+    private DagStateStore failedDagStateStore;
     private BlockingQueue<Dag<JobExecutionPlan>> queue;
     private BlockingQueue<String> cancelQueue;
+    private BlockingQueue<String> resumeQueue;
 
     /**
      * Constructor.
      */
-    DagManagerThread(JobStatusRetriever jobStatusRetriever, DagStateStore dagStateStore,
-        BlockingQueue<Dag<JobExecutionPlan>> queue, BlockingQueue<String> cancelQueue, boolean instrumentationEnabled) {
+    DagManagerThread(JobStatusRetriever jobStatusRetriever, DagStateStore dagStateStore, DagStateStore failedDagStateStore,
+        BlockingQueue<Dag<JobExecutionPlan>> queue, BlockingQueue<String> cancelQueue, BlockingQueue<String> resumeQueue,
+        boolean instrumentationEnabled, int defaultQuota, Map<String, Integer> perUserQuota, Set<String> failedDagIds,
+        ContextAwareMeter allSuccessfulMeter, ContextAwareMeter allFailedMeter) {
       this.jobStatusRetriever = jobStatusRetriever;
       this.dagStateStore = dagStateStore;
+      this.failedDagStateStore = failedDagStateStore;
+      this.failedDagIds = failedDagIds;
       this.queue = queue;
       this.cancelQueue = cancelQueue;
+      this.resumeQueue = resumeQueue;
+      this.defaultQuota = defaultQuota;
+      this.perUserQuota = perUserQuota;
+      this.allSuccessfulMeter = allSuccessfulMeter;
+      this.allFailedMeter = allFailedMeter;
       if (instrumentationEnabled) {
         this.metricContext = Instrumented.getMetricContext(ConfigUtils.configToState(ConfigFactory.empty()), getClass());
         this.eventSubmitter = Optional.of(new EventSubmitter.Builder(this.metricContext, "org.apache.gobblin.service").build());
         this.jobStatusPolledTimer = Optional.of(this.metricContext.timer(ServiceMetricNames.JOB_STATUS_POLLED_TIMER));
+        ContextAwareGauge<Long> orchestrationDelayMetric = metricContext.newContextAwareGauge(ServiceMetricNames.FLOW_ORCHESTRATION_DELAY,
+            () -> orchestrationDelay.get());
+        this.metricContext.register(orchestrationDelayMetric);
       } else {
         this.metricContext = null;
         this.eventSubmitter = Optional.absent();
@@ -421,6 +499,13 @@ public class DagManager extends AbstractIdleService {
           }
         }
 
+        while (!resumeQueue.isEmpty()) {
+          String dagId = resumeQueue.poll();
+          beginResumingDag(dagId);
+        }
+
+        finishResumingDags();
+
         log.debug("Polling job statuses..");
         //Poll and update the job statuses of running jobs.
         pollAndAdvanceDag();
@@ -431,6 +516,74 @@ public class DagManager extends AbstractIdleService {
         log.debug("Clean up done");
       } catch (Exception e) {
         log.error("Exception encountered in {}", getClass().getName(), e);
+      }
+    }
+
+    /**
+     * Begin resuming a dag by setting the status of both the dag and the failed/cancelled dag nodes to {@link ExecutionStatus#PENDING_RESUME},
+     * and also sending events so that this status will be reflected in the job status state store.
+     */
+    private void beginResumingDag(String dagId) throws IOException {
+      if (!this.failedDagIds.contains(dagId)) {
+        log.warn("No dag found with dagId " + dagId + ", so cannot resume flow");
+        return;
+      }
+      Dag<JobExecutionPlan> dag = this.failedDagStateStore.getDag(dagId);
+      if (dag == null) {
+        log.error("Dag " + dagId + " was found in memory but not found in failed dag state store");
+        return;
+      }
+
+      long flowResumeTime = System.currentTimeMillis();
+
+      // Set the flow and it's failed or cancelled nodes to PENDING_RESUME so that the flow will be resumed from the point before it failed
+      DagManagerUtils.emitFlowEvent(this.eventSubmitter, dag, TimingEvent.FlowTimings.FLOW_PENDING_RESUME);
+      for (DagNode<JobExecutionPlan> node : dag.getNodes()) {
+        ExecutionStatus executionStatus = node.getValue().getExecutionStatus();
+        if (executionStatus.equals(FAILED) || executionStatus.equals(CANCELLED)) {
+          node.getValue().setExecutionStatus(PENDING_RESUME);
+          // reset currentAttempts because we do not want to count previous execution's attempts in deciding whether to retry a job
+          node.getValue().setCurrentAttempts(0);
+          Map<String, String> jobMetadata = TimingEventUtils.getJobMetadata(Maps.newHashMap(), node.getValue());
+          this.eventSubmitter.get().getTimingEvent(TimingEvent.LauncherTimings.JOB_PENDING_RESUME).stop(jobMetadata);
+        }
+
+        // Set flowStartTime so that flow SLA will be based on current time instead of original flow
+        node.getValue().setFlowStartTime(flowResumeTime);
+      }
+
+      this.resumingDags.put(dagId, dag);
+    }
+
+    /**
+     * Finish resuming dags by first verifying the status is correct (flow should be {@link ExecutionStatus#PENDING_RESUME}
+     * and jobs should not be {@link ExecutionStatus#FAILED} or {@link ExecutionStatus#CANCELLED}) and then calling
+     * {@link #initialize}. This is separated from {@link #beginResumingDag} because it could take some time for the
+     * job status state store to reflect the updated status.
+     */
+    private void finishResumingDags() throws IOException {
+      for (Map.Entry<String, Dag<JobExecutionPlan>> dag : this.resumingDags.entrySet()) {
+        JobStatus flowStatus = pollFlowStatus(dag.getValue());
+        if (flowStatus == null || !flowStatus.getEventName().equals(PENDING_RESUME.name())) {
+          continue;
+        }
+
+        boolean dagReady = true;
+        for (DagNode<JobExecutionPlan> node : dag.getValue().getNodes()) {
+          JobStatus jobStatus = pollJobStatus(node);
+          if (jobStatus == null || jobStatus.getEventName().equals(FAILED.name()) || jobStatus.getEventName().equals(CANCELLED.name())) {
+            dagReady = false;
+            break;
+          }
+        }
+
+        if (dagReady) {
+          this.dagStateStore.writeCheckpoint(dag.getValue());
+          this.failedDagStateStore.cleanUp(dag.getValue());
+          this.failedDagIds.remove(dag.getKey());
+          this.resumingDags.remove(dag.getKey());
+          initialize(dag.getValue());
+        }
       }
     }
 
@@ -448,6 +601,9 @@ public class DagManager extends AbstractIdleService {
         for (DagNode<JobExecutionPlan> dagNodeToCancel : dagNodesToCancel) {
           cancelDagNode(dagNodeToCancel);
         }
+
+        this.dags.get(dagToCancel).setFlowEvent(TimingEvent.FlowTimings.FLOW_CANCELLED);
+        this.dags.get(dagToCancel).setMessage("Flow killed by request");
       } else {
         log.warn("Did not find Dag with id {}, it might be already cancelled/finished.", dagToCancel);
       }
@@ -461,7 +617,7 @@ public class DagManager extends AbstractIdleService {
         props.put(ConfigurationKeys.SPEC_PRODUCER_SERIALIZED_FUTURE, serializedFuture);
         sendCancellationEvent(dagNodeToCancel.getValue());
       }
-      DagManagerUtils.getSpecProducer(dagNodeToCancel).deleteSpec(null, props);
+      DagManagerUtils.getSpecProducer(dagNodeToCancel).cancelJob(dagNodeToCancel.getValue().getJobSpec().getUri(), props);
     }
 
     private void sendCancellationEvent(JobExecutionPlan jobExecutionPlan) {
@@ -488,13 +644,30 @@ public class DagManager extends AbstractIdleService {
 
       this.dags.put(dagId, dag);
       log.debug("Dag {} - determining if any jobs are already running.", DagManagerUtils.getFullyQualifiedDagName(dag));
+
+      //A flag to indicate if the flow is already running.
+      boolean isDagRunning = false;
       //Are there any jobs already in the running state? This check is for Dags already running
       //before a leadership change occurs.
       for (DagNode<JobExecutionPlan> dagNode : dag.getNodes()) {
         if (DagManagerUtils.getExecutionStatus(dagNode) == RUNNING) {
           addJobState(dagId, dagNode);
+          //Update the running jobs counter.
+          getRunningJobsCounter(dagNode).inc();
+          isDagRunning = true;
         }
       }
+
+      FlowId flowId = DagManagerUtils.getFlowId(dag);
+      if (!flowGauges.containsKey(flowId.toString())) {
+        String flowStateGaugeName = MetricRegistry.name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX, flowId.getFlowGroup(),
+            flowId.getFlowName(), ServiceMetricNames.RUNNING_STATUS);
+        flowGauges.put(flowId.toString(), FlowState.RUNNING);
+        ContextAwareGauge<Integer> gauge = RootMetricContext
+            .get().newContextAwareGauge(flowStateGaugeName, () -> flowGauges.get(flowId.toString()).value);
+        RootMetricContext.get().register(flowStateGaugeName, gauge);
+      }
+
       log.debug("Dag {} submitting jobs ready for execution.", DagManagerUtils.getFullyQualifiedDagName(dag));
       //Determine the next set of jobs to run and submit them for execution
       Map<String, Set<DagNode<JobExecutionPlan>>> nextSubmitted = submitNext(dagId);
@@ -504,6 +677,14 @@ public class DagManager extends AbstractIdleService {
 
       // Set flow status to running
       DagManagerUtils.emitFlowEvent(this.eventSubmitter, dag, TimingEvent.FlowTimings.FLOW_RUNNING);
+      flowGauges.put(flowId.toString(), FlowState.RUNNING);
+
+      // Report the orchestration delay the first time the Dag is initialized. Orchestration delay is defined as
+      // the time difference between the instant when a flow first transitions to the running state and the instant
+      // when the flow is submitted to Gobblin service.
+      if (!isDagRunning) {
+        this.orchestrationDelay.set(System.currentTimeMillis() - DagManagerUtils.getFlowExecId(dag));
+      }
 
       log.info("Dag {} Initialization complete.", DagManagerUtils.getFullyQualifiedDagName(dag));
     }
@@ -590,14 +771,19 @@ public class DagManager extends AbstractIdleService {
       }
       ExecutionStatus executionStatus = valueOf(jobStatus.getEventName());
       long timeOutForJobStart = DagManagerUtils.getJobStartSla(node);
-      long jobStartTime = jobStatus.getStartTime();
+      long jobOrchestratedTime = jobStatus.getOrchestratedTime();
 
-      if (executionStatus == ORCHESTRATED && System.currentTimeMillis() - jobStartTime > timeOutForJobStart) {
+      if (executionStatus == ORCHESTRATED && System.currentTimeMillis() - jobOrchestratedTime > timeOutForJobStart) {
         log.info("Job {} of flow {} exceeded the job start SLA of {} ms. Killing the job now...",
             DagManagerUtils.getJobName(node),
             DagManagerUtils.getFullyQualifiedDagName(node),
             timeOutForJobStart);
         cancelDagNode(node);
+
+        String dagId = DagManagerUtils.generateDagId(node);
+        this.dags.get(dagId).setFlowEvent(TimingEvent.FlowTimings.FLOW_CANCELLED);
+        this.dags.get(dagId).setMessage("Flow killed because no update received for " + timeOutForJobStart + " ms after orchestration");
+
         return true;
       } else {
         return false;
@@ -638,12 +824,15 @@ public class DagManager extends AbstractIdleService {
         dagToSLA.put(dagId, flowSla);
       }
 
-      if (flowSla != DagManagerUtils.NO_SLA && currentTime > flowStartTime + flowSla) {
+      if (currentTime > flowStartTime + flowSla) {
         log.info("Flow {} exceeded the SLA of {} ms. Killing the job {} now...",
-            node.getValue().getJobSpec().getConfig().getString(ConfigurationKeys.FLOW_NAME_KEY),
-            node.getValue().getJobSpec().getConfig().getString(ConfigurationKeys.JOB_NAME_KEY),
-            flowSla);
+            node.getValue().getJobSpec().getConfig().getString(ConfigurationKeys.FLOW_NAME_KEY), flowSla,
+            node.getValue().getJobSpec().getConfig().getString(ConfigurationKeys.JOB_NAME_KEY));
         cancelDagNode(node);
+
+        this.dags.get(dagId).setFlowEvent(TimingEvent.FlowTimings.FLOW_CANCELLED);
+        this.dags.get(dagId).setMessage("Flow killed due to exceeding SLA of " + flowSla + " ms");
+
         return true;
       }
       return false;
@@ -660,6 +849,25 @@ public class DagManager extends AbstractIdleService {
       String jobGroup = jobConfig.getString(ConfigurationKeys.JOB_GROUP_KEY);
       String jobName = jobConfig.getString(ConfigurationKeys.JOB_NAME_KEY);
 
+      return pollStatus(flowGroup, flowName, flowExecutionId, jobGroup, jobName);
+    }
+
+    /**
+     * Retrieve the flow's {@link JobStatus} (i.e. job status with {@link JobStatusRetriever#NA_KEY} as job name/group) from a dag
+     */
+    private JobStatus pollFlowStatus(Dag<JobExecutionPlan> dag) {
+      if (dag == null || dag.isEmpty()) {
+        return null;
+      }
+      Config jobConfig = dag.getNodes().get(0).getValue().getJobSpec().getConfig();
+      String flowGroup = jobConfig.getString(ConfigurationKeys.FLOW_GROUP_KEY);
+      String flowName = jobConfig.getString(ConfigurationKeys.FLOW_NAME_KEY);
+      long flowExecutionId = jobConfig.getLong(ConfigurationKeys.FLOW_EXECUTION_ID_KEY);
+
+      return pollStatus(flowGroup, flowName, flowExecutionId, JobStatusRetriever.NA_KEY, JobStatusRetriever.NA_KEY);
+    }
+
+    private JobStatus pollStatus(String flowGroup, String flowName, long flowExecutionId, String jobGroup, String jobName) {
       long pollStartTime = System.nanoTime();
       Iterator<JobStatus> jobStatusIterator =
           this.jobStatusRetriever.getJobStatusesForFlowExecution(flowName, flowGroup, flowExecutionId, jobName, jobGroup);
@@ -704,16 +912,17 @@ public class DagManager extends AbstractIdleService {
       JobSpec jobSpec = DagManagerUtils.getJobSpec(dagNode);
       Map<String, String> jobMetadata = TimingEventUtils.getJobMetadata(Maps.newHashMap(), jobExecutionPlan);
 
-      String specExecutorUri = dagNode.getValue().getSpecExecutor().getUri().toString();
+      String specExecutorUri = DagManagerUtils.getSpecExecutorUri(dagNode);
 
       // Run this spec on selected executor
       SpecProducer producer = null;
       try {
+        checkQuota(dagNode);
         producer = DagManagerUtils.getSpecProducer(dagNode);
         TimingEvent jobOrchestrationTimer = this.eventSubmitter.isPresent() ? this.eventSubmitter.get().
             getTimingEvent(TimingEvent.LauncherTimings.JOB_ORCHESTRATED) : null;
 
-        //Submit the job to the SpecProducer, which in turn performs the actual job submission to the SpecExecutor instance.
+        // Submit the job to the SpecProducer, which in turn performs the actual job submission to the SpecExecutor instance.
         // The SpecProducer implementations submit the job to the underlying executor and return when the submission is complete,
         // either successfully or unsuccessfully. To catch any exceptions in the job submission, the DagManagerThread
         // blocks (by calling Future#get()) until the submission is completed.
@@ -738,11 +947,66 @@ public class DagManager extends AbstractIdleService {
       } catch (Exception e) {
         TimingEvent jobFailedTimer = this.eventSubmitter.isPresent() ? this.eventSubmitter.get().
             getTimingEvent(TimingEvent.LauncherTimings.JOB_FAILED) : null;
-        log.error("Cannot submit job: {} on Executor: {}", DagManagerUtils.getFullyQualifiedJobName(dagNode), specExecutorUri, e);
+        String message = "Cannot submit job " + DagManagerUtils.getFullyQualifiedJobName(dagNode) + " on executor " + specExecutorUri;
+        log.error(message, e);
+        jobMetadata.put(TimingEvent.METADATA_MESSAGE, message + " due to " + e.getMessage());
         if (jobFailedTimer != null) {
           jobFailedTimer.stop(jobMetadata);
         }
       }
+    }
+
+    private void checkQuota(DagNode<JobExecutionPlan> dagNode) throws IOException {
+      String proxyUser = ConfigUtils.getString(dagNode.getValue().getJobSpec().getConfig(), AzkabanProjectConfig.USER_TO_PROXY, null);
+      String specExecutorUri = DagManagerUtils.getSpecExecutorUri(dagNode);
+      boolean proxyUserCheck = true;
+      if (proxyUser != null) {
+        proxyUserCheck = incrementMapAndCheckQuota(proxyUserToJobCount, proxyUser, dagNode);
+      }
+
+      String serializedRequesters = DagManagerUtils.getSerializedRequesterList(dagNode);
+      boolean requesterCheck = true;
+      String requesterMessage = null;
+      if (serializedRequesters != null) {
+        for (ServiceRequester requester : RequesterService.deserialize(serializedRequesters)) {
+          requesterCheck &= incrementMapAndCheckQuota(requesterToJobCount, requester.getName(), dagNode);
+          if (!requesterCheck && requesterMessage == null) {
+            requesterMessage = "Quota exceeded for requester " + requester.getName() + " on executor " + specExecutorUri + ": quota="
+                + getQuotaForUser(requester.getName()) + ", runningJobs=" + requesterToJobCount.get(DagManagerUtils.getUserQuotaKey(requester.getName(), dagNode));
+          }
+        }
+      }
+
+      // Throw errors for reach quota at the end to avoid inconsistent job counts
+      if (!proxyUserCheck) {
+        throw new IOException("Quota exceeded for proxy user " + proxyUser + " on executor " + specExecutorUri +
+            ": quota=" + getQuotaForUser(proxyUser) + ", runningJobs=" + proxyUserToJobCount.get(DagManagerUtils.getUserQuotaKey(proxyUser, dagNode)));
+      }
+
+      if (!requesterCheck) {
+        throw new IOException(requesterMessage);
+      }
+    }
+
+    /**
+     * Increment quota by one for the given map and key.
+     * @return true if quota is not reached for this user or user is whitelisted, false otherwise.
+     */
+    private boolean incrementMapAndCheckQuota(Map<String, Integer> quotaMap, String user, DagNode<JobExecutionPlan> dagNode) {
+      String key = DagManagerUtils.getUserQuotaKey(user, dagNode);
+      int jobCount = quotaMap.getOrDefault(key, 0);
+
+      // Only increment job count for first attempt, since job is considered running between retries
+      if (dagNode.getValue().getCurrentAttempts() == 1) {
+        jobCount++;
+        quotaMap.put(key, jobCount);
+      }
+
+      return jobCount <= getQuotaForUser(user);
+    }
+
+    private int getQuotaForUser(String user) {
+      return perUserQuota.getOrDefault(user, defaultQuota);
     }
 
     /**
@@ -760,6 +1024,8 @@ public class DagManager extends AbstractIdleService {
       ExecutionStatus jobStatus = DagManagerUtils.getExecutionStatus(dagNode);
       log.info("Job {} of Dag {} has finished with status {}", jobName, dagId, jobStatus.name());
 
+      releaseQuota(dagNode);
+
       if (this.metricContext != null) {
         getRunningJobsCounter(dagNode).dec();
         getRunningJobsCounterForUser(dagNode).forEach(counter -> counter.dec());
@@ -767,8 +1033,15 @@ public class DagManager extends AbstractIdleService {
 
       switch (jobStatus) {
         // TODO : For now treat canceled as failed, till we introduce failure option - CANCEL
-        case CANCELLED:
         case FAILED:
+          dag.setMessage("Flow failed because job " + jobName + " failed");
+          if (DagManagerUtils.getFailureOption(dag) == FailureOption.FINISH_RUNNING) {
+            this.failedDagIdsFinishRunning.add(dagId);
+          } else {
+            this.failedDagIdsFinishAllPossible.add(dagId);
+          }
+          return Maps.newHashMap();
+        case CANCELLED:
           if (DagManagerUtils.getFailureOption(dag) == FailureOption.FINISH_RUNNING) {
             this.failedDagIdsFinishRunning.add(dagId);
           } else {
@@ -780,6 +1053,33 @@ public class DagManager extends AbstractIdleService {
         default:
           log.warn("It should not reach here. Job status is unexpected.");
           return Maps.newHashMap();
+      }
+    }
+
+    /**
+     * Decrement the quota by one for the proxy user and requesters corresponding to the provided {@link DagNode}.
+     */
+    private void releaseQuota(DagNode<JobExecutionPlan> dagNode) {
+      String proxyUser = ConfigUtils.getString(dagNode.getValue().getJobSpec().getConfig(), AzkabanProjectConfig.USER_TO_PROXY, null);
+      if (proxyUser != null) {
+        String proxyUserKey = DagManagerUtils.getUserQuotaKey(proxyUser, dagNode);
+        if (proxyUserToJobCount.containsKey(proxyUserKey) && proxyUserToJobCount.get(proxyUserKey) > 0) {
+          proxyUserToJobCount.put(proxyUserKey, proxyUserToJobCount.get(proxyUserKey) - 1);
+        }
+      }
+
+      String serializedRequesters = DagManagerUtils.getSerializedRequesterList(dagNode);
+      if (serializedRequesters != null) {
+        try {
+          for (ServiceRequester requester : RequesterService.deserialize(serializedRequesters)) {
+            String requesterKey = DagManagerUtils.getUserQuotaKey(requester.getName(), dagNode);
+            if (requesterToJobCount.containsKey(requesterKey) && requesterToJobCount.get(requesterKey) > 0) {
+              requesterToJobCount.put(requesterKey, requesterToJobCount.get(requesterKey) - 1);
+            }
+          }
+        } catch (IOException e) {
+          log.error("Failed to release quota for requester list " + serializedRequesters, e);
+        }
       }
     }
 
@@ -802,13 +1102,14 @@ public class DagManager extends AbstractIdleService {
     }
 
     private boolean hasRunningJobs(String dagId) {
-      return !this.dagToJobs.get(dagId).isEmpty();
+      List<DagNode<JobExecutionPlan>> dagNodes = this.dagToJobs.get(dagId);
+      return dagNodes != null && !dagNodes.isEmpty();
     }
 
     private ContextAwareCounter getRunningJobsCounter(DagNode<JobExecutionPlan> dagNode) {
       return metricContext.contextAwareCounter(
           MetricRegistry.name(
-              MetricReportUtils.GOBBLIN_SERVICE_METRICS_PREFIX,
+              ServiceMetricNames.GOBBLIN_SERVICE_PREFIX,
               ServiceMetricNames.RUNNING_FLOWS_COUNTER,
               dagNode.getValue().getSpecExecutor().getUri().toString()));
     }
@@ -821,17 +1122,17 @@ public class DagManager extends AbstractIdleService {
       if (StringUtils.isNotEmpty(proxy)) {
         counters.add(metricContext.contextAwareCounter(
             MetricRegistry.name(
-                MetricReportUtils.GOBBLIN_SERVICE_METRICS_PREFIX,
+                ServiceMetricNames.GOBBLIN_SERVICE_PREFIX,
                 ServiceMetricNames.SERVICE_USERS, proxy)));
       }
 
       try {
-        String serializedRequesters = ConfigUtils.getString(configs, RequesterService.REQUESTER_LIST, null);
+        String serializedRequesters = DagManagerUtils.getSerializedRequesterList(dagNode);
         if (StringUtils.isNotEmpty(serializedRequesters)) {
           List<ServiceRequester> requesters = RequesterService.deserialize(serializedRequesters);
           for (ServiceRequester requester : requesters) {
             counters.add(metricContext.contextAwareCounter(MetricRegistry
-                .name(MetricReportUtils.GOBBLIN_SERVICE_METRICS_PREFIX, ServiceMetricNames.SERVICE_USERS, requester.getName())));
+                .name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX, ServiceMetricNames.SERVICE_USERS, requester.getName())));
           }
         }
       } catch (IOException e) {
@@ -840,10 +1141,17 @@ public class DagManager extends AbstractIdleService {
 
       return counters;
     }
+
+    private ContextAwareMeter getGroupMeterForDag(String dagId, String meterName, Map<String, ContextAwareMeter> meterMap) {
+      String flowGroup = DagManagerUtils.getFlowId(this.dags.get(dagId)).getFlowGroup();
+      return meterMap.computeIfAbsent(flowGroup,
+          group -> metricContext.contextAwareMeter(MetricRegistry.name(ServiceMetricNames.GOBBLIN_SERVICE_PREFIX, group, meterName)));
+    }
+
     /**
      * Perform clean up. Remove a dag from the dagstore if the dag is complete and update internal state.
      */
-    private void cleanUp() {
+    private void cleanUp() throws IOException {
       List<String> dagIdstoClean = new ArrayList<>();
       //Clean up failed dags
       for (String dagId : this.failedDagIdsFinishRunning) {
@@ -854,6 +1162,7 @@ public class DagManager extends AbstractIdleService {
           deleteJobState(dagId, dagNode);
         }
         log.info("Dag {} has finished with status FAILED; Cleaning up dag from the state store.", dagId);
+        onFlowFailure(dagId);
         // send an event before cleaning up dag
         DagManagerUtils.emitFlowEvent(this.eventSubmitter, this.dags.get(dagId), TimingEvent.FlowTimings.FLOW_FAILED);
         dagIdstoClean.add(dagId);
@@ -864,8 +1173,12 @@ public class DagManager extends AbstractIdleService {
         if (!hasRunningJobs(dagId) && !this.failedDagIdsFinishRunning.contains(dagId)) {
           String status = TimingEvent.FlowTimings.FLOW_SUCCEEDED;
           if (this.failedDagIdsFinishAllPossible.contains(dagId)) {
+            onFlowFailure(dagId);
             status = TimingEvent.FlowTimings.FLOW_FAILED;
             this.failedDagIdsFinishAllPossible.remove(dagId);
+            flowGauges.put(DagManagerUtils.getFlowId(this.dags.get(dagId)).toString(), FlowState.FAILED);
+          } else {
+            onFlowSuccess(dagId);
           }
           log.info("Dag {} has finished with status {}; Cleaning up dag from the state store.", dagId, status);
           // send an event before cleaning up dag
@@ -879,6 +1192,36 @@ public class DagManager extends AbstractIdleService {
       }
     }
 
+    private void onFlowSuccess(String dagId) {
+      if (this.metricContext != null) {
+        flowGauges.put(DagManagerUtils.getFlowId(this.dags.get(dagId)).toString(), FlowState.SUCCESSFUL);
+        this.allSuccessfulMeter.mark();
+        getGroupMeterForDag(dagId, ServiceMetricNames.SUCCESSFUL_FLOW_METER, groupSuccessfulMeters).mark();
+      }
+    }
+
+    private void onFlowFailure(String dagId) {
+      addFailedDag(dagId);
+      if (this.metricContext != null) {
+        flowGauges.put(DagManagerUtils.getFlowId(this.dags.get(dagId)).toString(), FlowState.FAILED);
+        this.allFailedMeter.mark();
+        getGroupMeterForDag(dagId, ServiceMetricNames.FAILED_FLOW_METER, groupFailureMeters).mark();
+      }
+    }
+
+    /**
+     * Add a dag to failed dag state store
+     */
+    private synchronized void addFailedDag(String dagId) {
+      try {
+        log.info("Adding dag " + dagId + " to failed dag state store");
+        this.failedDagStateStore.writeCheckpoint(this.dags.get(dagId));
+      } catch (IOException e) {
+        log.error("Failed to add dag " + dagId + " to failed dag state store", e);
+      }
+      this.failedDagIds.add(dagId);
+    }
+
     /**
      * Note that removal of a {@link Dag} entry in {@link #dags} needs to be happen after {@link #cleanUp()}
      * since the real {@link Dag} object is required for {@link #cleanUp()},
@@ -886,6 +1229,8 @@ public class DagManager extends AbstractIdleService {
      * @param dagId
      */
     private synchronized void cleanUpDag(String dagId) {
+      // clears flow event after cancelled job to allow resume event status to be set
+      this.dags.get(dagId).setFlowEvent(null);
        try {
          this.dagStateStore.cleanUp(dags.get(dagId));
        } catch (IOException ioe) {
@@ -893,6 +1238,55 @@ public class DagManager extends AbstractIdleService {
        }
       this.dags.remove(dagId);
       this.dagToJobs.remove(dagId);
+    }
+  }
+
+  private enum FlowState {
+    FAILED(-1),
+    RUNNING(0),
+    SUCCESSFUL(1);
+
+    public int value;
+
+    FlowState(int value) {
+      this.value = value;
+    }
+  }
+
+  /**
+   * Thread that runs retention on failed dags based on their original start time (which is the flow execution ID).
+   */
+  public static class FailedDagRetentionThread implements Runnable {
+    private final DagStateStore failedDagStateStore;
+    private final Set<String> failedDagIds;
+    private final long failedDagRetentionTime;
+
+    FailedDagRetentionThread(DagStateStore failedDagStateStore, Set<String> failedDagIds, long failedDagRetentionTime) {
+      this.failedDagStateStore = failedDagStateStore;
+      this.failedDagIds = failedDagIds;
+      this.failedDagRetentionTime = failedDagRetentionTime;
+    }
+
+    @Override
+    public void run() {
+      try {
+        log.info("Cleaning failed dag state store");
+        long startTime = System.currentTimeMillis();
+        int numCleaned = 0;
+
+        Set<String> failedDagIdsCopy = new HashSet<>(this.failedDagIds);
+        for (String dagId : failedDagIdsCopy) {
+          if (this.failedDagRetentionTime > 0L && startTime > DagManagerUtils.getFlowExecId(dagId) + this.failedDagRetentionTime) {
+            this.failedDagStateStore.cleanUp(dagId);
+            this.failedDagIds.remove(dagId);
+            numCleaned++;
+          }
+        }
+
+      log.info("Cleaned " + numCleaned + " dags from the failed dag state store");
+      } catch (Exception e) {
+        log.error("Failed to run retention on failed dag state store", e);
+      }
     }
   }
 

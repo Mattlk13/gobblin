@@ -53,13 +53,16 @@ public interface SpecExecutor {
 
   /** A communication socket for generating spec to assigned physical executors, paired with
    * a consumer on the physical executor side. */
-  Future<? extends SpecProducer> getProducer();
+  Future<? extends SpecProducer<Spec>> getProducer();
+
+  String VERB_KEY = "Verb";
 
   public static enum Verb {
     ADD(1, "add"),
     UPDATE(2, "update"),
     DELETE(3, "delete"),
-    UNKNOWN(4, "unknown");
+    UNKNOWN(4, "unknown"),
+    CANCEL(5, "cancel");
 
     private int _id;
     private String _verb;

@@ -19,6 +19,7 @@ package org.apache.gobblin.service;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -35,17 +36,20 @@ import com.linkedin.r2.RemoteInvocationException;
 import com.linkedin.r2.transport.common.Client;
 import com.linkedin.r2.transport.common.bridge.client.TransportClientAdapter;
 import com.linkedin.r2.transport.http.client.HttpClientFactory;
+import com.linkedin.restli.client.ActionRequest;
 import com.linkedin.restli.client.CreateIdEntityRequest;
 import com.linkedin.restli.client.DeleteRequest;
+import com.linkedin.restli.client.FindRequest;
+import com.linkedin.restli.client.GetAllRequest;
 import com.linkedin.restli.client.GetRequest;
 import com.linkedin.restli.client.PartialUpdateRequest;
 import com.linkedin.restli.client.Response;
 import com.linkedin.restli.client.ResponseFuture;
 import com.linkedin.restli.client.RestClient;
 import com.linkedin.restli.client.UpdateRequest;
+import com.linkedin.restli.common.CollectionResponse;
 import com.linkedin.restli.common.ComplexResourceKey;
 import com.linkedin.restli.common.EmptyRecord;
-import com.linkedin.restli.common.IdEntityResponse;
 import com.linkedin.restli.common.PatchRequest;
 
 
@@ -66,10 +70,14 @@ public class FlowConfigV2Client implements Closeable {
    * @param serverUri address and port of the REST server
    */
   public FlowConfigV2Client(String serverUri) {
+    this(serverUri, Collections.emptyMap());
+  }
+
+  public FlowConfigV2Client(String serverUri, Map<String, String> properties) {
     LOG.debug("FlowConfigClient with serverUri " + serverUri);
 
     _httpClientFactory = Optional.of(new HttpClientFactory());
-    Client r2Client = new TransportClientAdapter(_httpClientFactory.get().getClient(Collections.<String, String>emptyMap()));
+    Client r2Client = new TransportClientAdapter(_httpClientFactory.get().getClient(properties));
     _restClient = Optional.of(new RestClient(r2Client, serverUri));
     _flowconfigsV2RequestBuilders = createRequestBuilders();
   }
@@ -107,10 +115,9 @@ public class FlowConfigV2Client implements Closeable {
 
     CreateIdEntityRequest<ComplexResourceKey<FlowId, FlowStatusId>, FlowConfig> request =
         _flowconfigsV2RequestBuilders.createAndGet().input(flowConfig).build();
-    ResponseFuture<IdEntityResponse<ComplexResourceKey<FlowId, FlowStatusId>, FlowConfig>> flowConfigResponseFuture =
-        _restClient.get().sendRequest(request);
+    Response<?> response = FlowClientUtils.sendRequestWithRetry(_restClient.get(), request, FlowconfigsV2RequestBuilders.getPrimaryResource());
 
-    return createFlowStatusId(flowConfigResponseFuture.getResponse().getLocation().toString());
+    return createFlowStatusId(response.getLocation().toString());
   }
 
   private FlowStatusId createFlowStatusId(String locationHeader) {
@@ -148,9 +155,7 @@ public class FlowConfigV2Client implements Closeable {
         _flowconfigsV2RequestBuilders.update().id(new ComplexResourceKey<>(flowId, new FlowStatusId()))
             .input(flowConfig).build();
 
-    ResponseFuture<EmptyRecord> response = _restClient.get().sendRequest(updateRequest);
-
-    response.getResponse();
+    FlowClientUtils.sendRequestWithRetry(_restClient.get(), updateRequest, FlowconfigsV2RequestBuilders.getPrimaryResource());
   }
 
   /**
@@ -167,9 +172,7 @@ public class FlowConfigV2Client implements Closeable {
         _flowconfigsV2RequestBuilders.partialUpdate().id(new ComplexResourceKey<>(flowId, new FlowStatusId()))
             .input(flowConfigPatch).build();
 
-    ResponseFuture<EmptyRecord> response = _restClient.get().sendRequest(partialUpdateRequest);
-
-    response.getResponse();
+    FlowClientUtils.sendRequestWithRetry(_restClient.get(), partialUpdateRequest, FlowconfigsV2RequestBuilders.getPrimaryResource());
   }
 
   /**
@@ -180,15 +183,45 @@ public class FlowConfigV2Client implements Closeable {
    */
   public FlowConfig getFlowConfig(FlowId flowId)
       throws RemoteInvocationException {
-    LOG.debug("getFlowConfig with groupName " + flowId.getFlowGroup() + " flowName " +
-        flowId.getFlowName());
+    LOG.debug("getFlowConfig with groupName " + flowId.getFlowGroup() + " flowName " + flowId.getFlowName());
 
     GetRequest<FlowConfig> getRequest = _flowconfigsV2RequestBuilders.get()
         .id(new ComplexResourceKey<>(flowId, new FlowStatusId())).build();
 
-    Response<FlowConfig> response =
-        _restClient.get().sendRequest(getRequest).getResponse();
+    Response<FlowConfig> response = _restClient.get().sendRequest(getRequest).getResponse();
     return response.getEntity();
+  }
+
+  /**
+   * Get all {@link FlowConfig}s
+   * @return all {@link FlowConfig}s
+   * @throws RemoteInvocationException
+   */
+  public Collection<FlowConfig> getAllFlowConfigs() throws RemoteInvocationException {
+    LOG.debug("getAllFlowConfigs called");
+
+    GetAllRequest<FlowConfig> getRequest = _flowconfigsV2RequestBuilders.getAll().build();
+    Response<CollectionResponse<FlowConfig>> response = _restClient.get().sendRequest(getRequest).getResponse();
+    return response.getEntity().getElements();
+  }
+
+  /**
+   * Get all {@link FlowConfig}s that matches the provided parameters. All the parameters are optional.
+   * If a parameter is null, it is ignored. {@see FlowConfigV2Resource#getFilteredFlows}
+   */
+  public Collection<FlowConfig> getFlowConfigs(String flowGroup, String flowName, String templateUri, String userToProxy,
+      String sourceIdentifier, String destinationIdentifier, String schedule, Boolean isRunImmediately, String owningGroup,
+      String propertyFilter) throws RemoteInvocationException {
+    LOG.debug("getAllFlowConfigs called");
+
+    FindRequest<FlowConfig> getRequest = _flowconfigsV2RequestBuilders.findByFilterFlows()
+        .flowGroupParam(flowGroup).flowNameParam(flowName).templateUriParam(templateUri).userToProxyParam(userToProxy)
+        .sourceIdentifierParam(sourceIdentifier).destinationIdentifierParam(destinationIdentifier).scheduleParam(schedule)
+        .isRunImmediatelyParam(isRunImmediately).owningGroupParam(owningGroup).propertyFilterParam(propertyFilter).build();
+
+    Response<CollectionResponse<FlowConfig>> response = _restClient.get().sendRequest(getRequest).getResponse();
+
+    return response.getEntity().getElements();
   }
 
   /**
@@ -202,9 +235,8 @@ public class FlowConfigV2Client implements Closeable {
 
     DeleteRequest<FlowConfig> deleteRequest = _flowconfigsV2RequestBuilders.delete()
         .id(new ComplexResourceKey<>(flowId, new FlowStatusId())).build();
-    ResponseFuture<EmptyRecord> response = _restClient.get().sendRequest(deleteRequest);
 
-    response.getResponse();
+    FlowClientUtils.sendRequestWithRetry(_restClient.get(), deleteRequest, FlowconfigsV2RequestBuilders.getPrimaryResource());
   }
 
   /**
@@ -222,6 +254,19 @@ public class FlowConfigV2Client implements Closeable {
     ResponseFuture<EmptyRecord> response = _restClient.get().sendRequest(deleteRequest);
 
     response.getResponse();
+  }
+
+  public String runImmediately(FlowId flowId)
+      throws RemoteInvocationException {
+    LOG.debug("runImmediately with groupName " + flowId.getFlowGroup() + " flowName " + flowId.getFlowName());
+
+    ActionRequest<String> runImmediatelyRequest = _flowconfigsV2RequestBuilders.actionRunImmediately()
+        .id(new ComplexResourceKey<>(flowId, new FlowStatusId())).build();
+
+    Response<String> response = (Response<String>) FlowClientUtils.sendRequestWithRetry(_restClient.get(), runImmediatelyRequest,
+        FlowconfigsV2RequestBuilders.getPrimaryResource());
+
+    return response.getEntity();
   }
 
   @Override

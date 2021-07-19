@@ -18,6 +18,7 @@
 package org.apache.gobblin.service.modules.restli;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Properties;
 import java.util.UUID;
 
@@ -34,10 +35,13 @@ import com.linkedin.restli.server.CreateResponse;
 import com.linkedin.restli.server.UpdateResponse;
 import com.linkedin.restli.server.util.PatchApplier;
 
+import javax.inject.Inject;
+import javax.inject.Named;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
+import org.apache.gobblin.runtime.api.FlowSpecSearchObject;
 import org.apache.gobblin.service.FlowConfig;
 import org.apache.gobblin.service.FlowConfigLoggedException;
 import org.apache.gobblin.service.FlowConfigResourceLocalHandler;
@@ -46,6 +50,7 @@ import org.apache.gobblin.service.FlowId;
 import org.apache.gobblin.service.ServiceConfigKeys;
 import org.apache.gobblin.service.modules.scheduler.GobblinServiceJobScheduler;
 import org.apache.gobblin.service.modules.utils.HelixUtils;
+import org.apache.gobblin.service.modules.utils.InjectionNames;
 
 
 /**
@@ -61,22 +66,37 @@ public class GobblinServiceFlowConfigResourceHandler implements FlowConfigsResou
   private FlowConfigResourceLocalHandler localHandler;
   private Optional<HelixManager> helixManager;
   private GobblinServiceJobScheduler jobScheduler;
+  private boolean forceLeader;
 
-  public GobblinServiceFlowConfigResourceHandler(String serviceName, boolean flowCatalogLocalCommit,
+  @Inject
+  public GobblinServiceFlowConfigResourceHandler(@Named(InjectionNames.SERVICE_NAME) String serviceName,
+      @Named(InjectionNames.FLOW_CATALOG_LOCAL_COMMIT) boolean flowCatalogLocalCommit,
       FlowConfigResourceLocalHandler handler,
       Optional<HelixManager> manager,
-      GobblinServiceJobScheduler jobScheduler) {
+      GobblinServiceJobScheduler jobScheduler,
+      @Named(InjectionNames.FORCE_LEADER) boolean forceLeader) {
     this.flowCatalogLocalCommit = flowCatalogLocalCommit;
     this.serviceName = serviceName;
     this.localHandler = handler;
     this.helixManager = manager;
     this.jobScheduler = jobScheduler;
+    this.forceLeader = forceLeader;
   }
 
   @Override
   public FlowConfig getFlowConfig(FlowId flowId)
       throws FlowConfigLoggedException {
     return this.localHandler.getFlowConfig(flowId);
+  }
+
+  @Override
+  public Collection<FlowConfig> getFlowConfig(FlowSpecSearchObject flowSpecSearchObject) throws FlowConfigLoggedException {
+    return this.localHandler.getFlowConfig(flowSpecSearchObject);
+  }
+
+  @Override
+  public Collection<FlowConfig> getAllFlowConfigs() {
+    return this.localHandler.getAllFlowConfigs();
   }
 
   /**
@@ -105,12 +125,16 @@ public class GobblinServiceFlowConfigResourceHandler implements FlowConfigsResou
 
     checkHelixConnection(ServiceConfigKeys.HELIX_FLOWSPEC_ADD, flowName, flowGroup);
 
+    if (forceLeader) {
+      HelixUtils.throwErrorIfNotLeader(helixManager);
+    }
+
     try {
       if (!jobScheduler.isActive() && helixManager.isPresent()) {
         CreateResponse response = null;
         if (this.flowCatalogLocalCommit) {
           // We will handle FS I/O locally for load balance before forwarding to remote node.
-          response = this.localHandler.createFlowConfig(flowConfig, false);
+          response = this.localHandler.createFlowConfig(flowConfig, true);
         }
 
         if (!flowConfig.hasExplain() || !flowConfig.isExplain()) {
@@ -154,6 +178,10 @@ public class GobblinServiceFlowConfigResourceHandler implements FlowConfigsResou
     }
 
     checkHelixConnection(ServiceConfigKeys.HELIX_FLOWSPEC_UPDATE, flowName, flowGroup);
+
+    if (forceLeader) {
+      HelixUtils.throwErrorIfNotLeader(helixManager);
+    }
 
     try {
       if (!jobScheduler.isActive() && helixManager.isPresent()) {
@@ -210,6 +238,10 @@ public class GobblinServiceFlowConfigResourceHandler implements FlowConfigsResou
     String flowGroup = flowId.getFlowGroup();
 
     checkHelixConnection(ServiceConfigKeys.HELIX_FLOWSPEC_REMOVE, flowName, flowGroup);
+
+    if (forceLeader) {
+      HelixUtils.throwErrorIfNotLeader(helixManager);
+    }
 
     try {
       if (!jobScheduler.isActive() && helixManager.isPresent()) {

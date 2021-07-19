@@ -23,7 +23,6 @@ import java.util.UUID;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.curator.test.TestingServer;
-import org.apache.gobblin.runtime.spec_catalog.FlowCatalog;
 import org.apache.hadoop.fs.Path;
 import org.eclipse.jetty.http.HttpStatus;
 import org.slf4j.Logger;
@@ -33,15 +32,16 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
-import com.google.common.base.Optional;
 import com.google.common.collect.Maps;
 import com.linkedin.data.template.StringMap;
+import com.linkedin.r2.transport.http.client.HttpClientFactory;
 import com.linkedin.restli.client.RestLiResponseException;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.metastore.MysqlJobStatusStateStoreFactory;
 import org.apache.gobblin.metastore.testing.ITestMetastoreDatabase;
 import org.apache.gobblin.metastore.testing.TestMetastoreDatabaseFactory;
+import org.apache.gobblin.runtime.spec_catalog.FlowCatalog;
 import org.apache.gobblin.service.FlowConfig;
 import org.apache.gobblin.service.FlowConfigClient;
 import org.apache.gobblin.service.FlowId;
@@ -50,6 +50,7 @@ import org.apache.gobblin.service.ServiceConfigKeys;
 import org.apache.gobblin.service.modules.utils.HelixUtils;
 import org.apache.gobblin.service.monitoring.FsJobStatusRetriever;
 import org.apache.gobblin.util.ConfigUtils;
+
 
 @Test
 public class GobblinServiceHATest {
@@ -140,6 +141,7 @@ public class GobblinServiceHATest {
     commonServiceCoreProperties.put("zookeeper.connect", testingZKServer.getConnectString());
     commonServiceCoreProperties.put(ConfigurationKeys.STATE_STORE_FACTORY_CLASS_KEY, MysqlJobStatusStateStoreFactory.class.getName());
     commonServiceCoreProperties.put(ServiceConfigKeys.GOBBLIN_SERVICE_JOB_STATUS_MONITOR_ENABLED_KEY, false);
+    commonServiceCoreProperties.put(ServiceConfigKeys.GOBBLIN_SERVICE_GIT_CONFIG_MONITOR_ENABLED_KEY, false);
 
     Properties node1ServiceCoreProperties = new Properties();
     node1ServiceCoreProperties.putAll(commonServiceCoreProperties);
@@ -158,22 +160,24 @@ public class GobblinServiceHATest {
     node2ServiceCoreProperties.put(QUARTZ_THREAD_POOL_COUNT, 3);
 
     // Start Node 1
-    this.node1GobblinServiceManager = new GobblinServiceManager("CoreService1", "1",
-        ConfigUtils.propertiesToConfig(node1ServiceCoreProperties), Optional.of(new Path(NODE_1_SERVICE_WORK_DIR)));
+    this.node1GobblinServiceManager = GobblinServiceManager.create("CoreService1", "1",
+        ConfigUtils.propertiesToConfig(node1ServiceCoreProperties), new Path(NODE_1_SERVICE_WORK_DIR));
     this.node1GobblinServiceManager.start();
 
     // Start Node 2
-    this.node2GobblinServiceManager = new GobblinServiceManager("CoreService2", "2",
-        ConfigUtils.propertiesToConfig(node2ServiceCoreProperties), Optional.of(new Path(NODE_2_SERVICE_WORK_DIR)));
+    this.node2GobblinServiceManager = GobblinServiceManager.create("CoreService2", "2",
+        ConfigUtils.propertiesToConfig(node2ServiceCoreProperties), new Path(NODE_2_SERVICE_WORK_DIR));
     this.node2GobblinServiceManager.start();
 
     // Initialize Node 1 Client
+    Map<String, String> transportClientProperties = Maps.newHashMap();
+    transportClientProperties.put(HttpClientFactory.HTTP_REQUEST_TIMEOUT, "10000");
     this.node1FlowConfigClient = new FlowConfigClient(String.format("http://localhost:%s/",
-        this.node1GobblinServiceManager.restliServer.getPort()));
+        this.node1GobblinServiceManager.restliServer.getPort()), transportClientProperties);
 
     // Initialize Node 2 Client
     this.node2FlowConfigClient = new FlowConfigClient(String.format("http://localhost:%s/",
-        this.node2GobblinServiceManager.restliServer.getPort()));
+        this.node2GobblinServiceManager.restliServer.getPort()), transportClientProperties);
   }
 
   private void cleanUpDir(String dir) throws Exception {
@@ -317,23 +321,17 @@ public class GobblinServiceHATest {
         .setProperties(new StringMap(flowProperties));
 
     // Try create on both nodes
-    RestLiResponseException exception1 = null;
     try {
       this.node1FlowConfigClient.createFlowConfig(flowConfig1);
     } catch (RestLiResponseException e) {
-      exception1 = e;
+      Assert.fail("Create Again should pass without complaining that the spec already exists.");
     }
-    Assert.assertNotNull(exception1);
-    Assert.assertEquals(exception1.getStatus(), com.linkedin.restli.common.HttpStatus.S_409_CONFLICT.getCode());
 
-    RestLiResponseException exception2 = null;
     try {
       this.node2FlowConfigClient.createFlowConfig(flowConfig2);
     } catch (RestLiResponseException e) {
-      exception2 = e;
+      Assert.fail("Create Again should pass without complaining that the spec already exists.");
     }
-    Assert.assertNotNull(exception2);
-    Assert.assertEquals(exception2.getStatus(), com.linkedin.restli.common.HttpStatus.S_409_CONFLICT.getCode());
 
     logger.info("+++++++++++++++++++ testCreateAgain END");
   }
@@ -483,13 +481,13 @@ public class GobblinServiceHATest {
     try {
       this.node1FlowConfigClient.updateFlowConfig(flowConfig);
     } catch (RestLiResponseException e) {
-      Assert.fail("Bad update should pass without complaining that the spec does not exists.");
+      Assert.assertEquals(e.getStatus(), HttpStatus.NOT_FOUND_404);
     }
 
     try {
       this.node2FlowConfigClient.updateFlowConfig(flowConfig);
     } catch (RestLiResponseException e) {
-      Assert.fail("Bad update should pass without complaining that the spec does not exists.");
+      Assert.assertEquals(e.getStatus(), HttpStatus.NOT_FOUND_404);
     }
 
     logger.info("+++++++++++++++++++ testBadUpdate END");
@@ -545,7 +543,7 @@ public class GobblinServiceHATest {
     logger.info("Total failover time in ms: " + (failOverEndTime - failOverStartTime));
 
     Assert.assertTrue(assertSuccess, "New master should take over all old master jobs.");
-
     logger.info("+++++++++++++++++++ testKillNode END");
   }
+
 }

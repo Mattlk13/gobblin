@@ -31,10 +31,18 @@
         "name" : "tag",
         "type" : "string",
         "optional" : true
+      }, {
+        "name" : "executionStatus",
+        "type" : "string",
+        "optional" : true
       } ]
     } ],
     "entity" : {
-      "path" : "/flowexecutions/{id}"
+      "path" : "/flowexecutions/{id}",
+      "actions" : [ {
+        "name" : "resume",
+        "doc" : "Resume a failed {@link FlowExecution} from the point before failure."
+      } ]
     }
   }
 }
